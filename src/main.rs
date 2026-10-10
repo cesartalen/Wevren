@@ -102,6 +102,8 @@ struct Wevren {
     conflict: Option<Conflict>,
     disk_revision: u64,
     watcher: Option<Task<anyhow::Result<()>>>,
+    navigation: Vec<PathBuf>,
+    navigation_index: Option<usize>,
 }
 
 impl Wevren {
@@ -142,6 +144,8 @@ impl Wevren {
             conflict: None,
             disk_revision: 0,
             watcher: None,
+            navigation: Vec::new(),
+            navigation_index: None,
         };
         this.reload(cx);
         this.focus.focus(window);
@@ -525,6 +529,8 @@ impl Wevren {
         self.conflict = None;
         self.disk_revision = self.disk_revision.wrapping_add(1);
         self.expanded.clear();
+        self.navigation.clear();
+        self.navigation_index = None;
         self.entries.clear();
         self.selected_folder = Some(folder.clone());
         self.folder_input = None;
@@ -536,11 +542,21 @@ impl Wevren {
 
     /// Shows the note at `path` in the editor.
     fn open_note(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_note_with_history(path, true, window, cx);
+    }
+
+    fn open_note_with_history(
+        &mut self,
+        path: PathBuf,
+        record: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         self.error = None;
         if !self.save(cx) {
             self.settings_open = false;
             cx.notify();
-            return;
+            return false;
         }
         if let Some(text) = self.report(notes::read(&path)) {
             self.baseline = Some(text.clone());
@@ -549,6 +565,16 @@ impl Wevren {
             self.editor
                 .update(cx, |editor, cx| editor.set_text(text, cx));
             self.editor.focus_handle(cx).focus(window);
+            if record
+                && self
+                    .navigation_index
+                    .is_none_or(|index| self.navigation[index] != path)
+            {
+                self.navigation
+                    .truncate(self.navigation_index.map_or(0, |index| index + 1));
+                self.navigation.push(path.clone());
+                self.navigation_index = Some(self.navigation.len() - 1);
+            }
             self.open = Some(path);
             self.selected_folder = self
                 .open
@@ -558,8 +584,31 @@ impl Wevren {
             self.rename_editor = None;
             self.find = None;
             self.settings_open = false;
+            cx.notify();
+            return true;
         }
         cx.notify();
+        false
+    }
+
+    fn navigation_target(&self, back: bool) -> Option<usize> {
+        let current = self.navigation_index?;
+        if back {
+            (0..current)
+                .rev()
+                .find(|&index| self.navigation[index].is_file())
+        } else {
+            (current + 1..self.navigation.len()).find(|&index| self.navigation[index].is_file())
+        }
+    }
+
+    fn navigate(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(index) = self.navigation_target(back)
+            && self.open_note_with_history(self.navigation[index].clone(), false, window, cx)
+        {
+            self.navigation_index = Some(index);
+            cx.notify();
+        }
     }
 
     fn reveal_open(&mut self) {
@@ -933,6 +982,11 @@ impl Wevren {
             if let Some((renamed, text)) =
                 self.report(links::rename(&root, &path, &title, &baseline))
             {
+                for visited in &mut self.navigation {
+                    if *visited == path {
+                        visited.clone_from(&renamed);
+                    }
+                }
                 self.open = Some(renamed);
                 self.baseline = Some(text.clone());
                 self.disk_revision = self.disk_revision.wrapping_add(1);
@@ -984,6 +1038,14 @@ impl Wevren {
 
     /// Handles the platform's shortcuts for saving and for a new note.
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.switcher.is_none()
+            && event.keystroke.modifiers.alt
+            && matches!(event.keystroke.key.as_str(), "left" | "right")
+        {
+            self.navigate(event.keystroke.key == "left", window, cx);
+            cx.stop_propagation();
+            return;
+        }
         if self.switcher.is_some() {
             if event.keystroke.modifiers.secondary() && event.keystroke.key == "p" {
                 self.close_switcher(window, cx);
@@ -1414,12 +1476,35 @@ fn icon_button(glyph: &'static str, size: f32, hover: Rgba, theme: Theme) -> Sta
 }
 
 /// Returns the custom titlebar: a draggable wordmark and the window buttons.
-fn titlebar(theme: Theme, cx: &mut Context<Wevren>) -> impl IntoElement {
+fn titlebar(
+    theme: Theme,
+    can_back: bool,
+    can_forward: bool,
+    cx: &mut Context<Wevren>,
+) -> impl IntoElement {
     let [min, max, close] = CAPTION_GLYPHS;
     div()
         .flex()
         .flex_none()
         .h(px(TITLEBAR_HEIGHT))
+        .children(
+            [
+                ("\u{e72b}", true, can_back),
+                ("\u{e72a}", false, can_forward),
+            ]
+            .into_iter()
+            .map(|(glyph, back, enabled)| {
+                icon_button(glyph, 12., theme.hover, theme)
+                    .when(enabled, Styled::cursor_pointer)
+                    .when(!enabled, |button| button.opacity(0.35))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        if enabled {
+                            this.navigate(back, window, cx);
+                        }
+                    }))
+            }),
+        )
         .child(
             div()
                 .flex()
@@ -1605,7 +1690,12 @@ impl Render for Wevren {
             .text_sm()
             .text_color(theme.text)
             .on_key_down(cx.listener(Self::key_down))
-            .child(titlebar(theme, cx))
+            .child(titlebar(
+                theme,
+                self.navigation_target(true).is_some(),
+                self.navigation_target(false).is_some(),
+                cx,
+            ))
             .child(
                 div()
                     .flex()

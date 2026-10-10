@@ -615,6 +615,9 @@ impl Editor {
     /// Handles the keys that move the caret, delete, or use the clipboard.
     fn key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let Keystroke { modifiers, key, .. } = &event.keystroke;
+        if modifiers.alt && matches!(key.as_str(), "left" | "right") {
+            return;
+        }
         let (caret, select) = (self.caret(), modifiers.shift);
         let step = select || self.selection.is_empty();
         // AltGr reports as control and alt together, and must keep typing characters.
