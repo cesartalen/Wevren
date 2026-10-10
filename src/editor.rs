@@ -622,6 +622,9 @@ impl Editor {
         let step = select || self.selection.is_empty();
         // AltGr reports as control and alt together, and must keep typing characters.
         let command = modifiers.secondary() && !modifiers.alt;
+        if command && key == "tab" {
+            return;
+        }
         if !command && !modifiers.alt && self.completion_key(key, cx) {
             cx.stop_propagation();
             return;

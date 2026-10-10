@@ -75,6 +75,12 @@ struct Conflict {
     disk: Option<String>,
 }
 
+#[derive(Debug)]
+struct Tab {
+    path: PathBuf,
+    editor: Entity<Editor>,
+}
+
 /// The root view.
 #[derive(Debug)]
 struct Wevren {
@@ -104,21 +110,13 @@ struct Wevren {
     watcher: Option<Task<anyhow::Result<()>>>,
     navigation: Vec<PathBuf>,
     navigation_index: Option<usize>,
+    tabs: Vec<Tab>,
 }
 
 impl Wevren {
     /// Creates the view from the saved settings.
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let editor = cx.new(Editor::new);
-        cx.subscribe(&editor, |this, _, _: &Edited, cx| {
-            this.schedule_save(cx);
-            this.refresh_find(false, cx);
-        })
-        .detach();
-        cx.subscribe_in(&editor, window, |this, _, link: &Followed, window, cx| {
-            this.follow(&link.0, window, cx);
-        })
-        .detach();
+        let editor = Self::note_editor(window, cx);
         cx.on_release(|this, cx| {
             this.save(cx);
         })
@@ -146,6 +144,7 @@ impl Wevren {
             watcher: None,
             navigation: Vec::new(),
             navigation_index: None,
+            tabs: Vec::new(),
         };
         this.reload(cx);
         this.focus.focus(window);
@@ -155,6 +154,28 @@ impl Wevren {
             view.update(cx, Self::prepare_close).unwrap_or(true)
         });
         this
+    }
+
+    fn note_editor(window: &mut Window, cx: &mut Context<Self>) -> Entity<Editor> {
+        let editor = cx.new(Editor::new);
+        cx.subscribe(&editor, |this, source, _: &Edited, cx| {
+            if this.editor == source {
+                this.schedule_save(cx);
+                this.refresh_find(false, cx);
+            }
+        })
+        .detach();
+        cx.subscribe_in(
+            &editor,
+            window,
+            |this, source, link: &Followed, window, cx| {
+                if this.editor == *source {
+                    this.follow(&link.0, window, cx);
+                }
+            },
+        )
+        .detach();
+        editor
     }
 
     fn prepare_close(&mut self, cx: &mut Context<Self>) -> bool {
@@ -531,6 +552,7 @@ impl Wevren {
         self.expanded.clear();
         self.navigation.clear();
         self.navigation_index = None;
+        self.tabs.clear();
         self.entries.clear();
         self.selected_folder = Some(folder.clone());
         self.folder_input = None;
@@ -558,12 +580,8 @@ impl Wevren {
             cx.notify();
             return false;
         }
-        if let Some(text) = self.report(notes::read(&path)) {
-            self.baseline = Some(text.clone());
-            self.conflict = None;
+        if self.activate_tab(&path, window, cx) {
             self.disk_revision = self.disk_revision.wrapping_add(1);
-            self.editor
-                .update(cx, |editor, cx| editor.set_text(text, cx));
             self.editor.focus_handle(cx).focus(window);
             if record
                 && self
@@ -589,6 +607,157 @@ impl Wevren {
         }
         cx.notify();
         false
+    }
+
+    fn activate_tab(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let existing = self.tabs.iter().position(|tab| tab.path == path);
+        let Some(disk) = self.report(notes::disk_text(path)) else {
+            return false;
+        };
+        if disk.is_none() && existing.is_none() {
+            self.error = Some("This note no longer exists.".into());
+            return false;
+        }
+        self.editor.update(cx, |editor, cx| {
+            editor.set_matches(Vec::new(), None, false, cx);
+        });
+        self.editor = if let Some(index) = existing {
+            self.tabs[index].editor.clone()
+        } else {
+            let editor = Self::note_editor(window, cx);
+            self.tabs.push(Tab {
+                path: path.to_path_buf(),
+                editor: editor.clone(),
+            });
+            editor
+        };
+        self.baseline.clone_from(&disk);
+        self.conflict = None;
+        if let Some(text) = disk {
+            if self.editor.read(cx).text() != text {
+                self.editor
+                    .update(cx, |editor, cx| editor.reload_text(text, cx));
+            }
+        } else {
+            self.conflict = Some(Conflict { disk: None });
+        }
+        self.sync_entries(cx);
+        true
+    }
+
+    fn close_tab(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.tabs.iter().position(|tab| tab.path == path) else {
+            return;
+        };
+        let active = self.open.as_deref() == Some(path);
+        if active && !self.save(cx) {
+            self.settings_open = false;
+            cx.notify();
+            return;
+        }
+        self.tabs.remove(index);
+        if active {
+            self.open = None;
+            self.baseline = None;
+            self.conflict = None;
+            self.find = None;
+            self.rename_editor = None;
+            self.disk_revision = self.disk_revision.wrapping_add(1);
+            if let Some(tab) = self.tabs.get(index.min(self.tabs.len().saturating_sub(1))) {
+                self.open_note(tab.path.clone(), window, cx);
+            } else {
+                self.focus.focus(window);
+            }
+        }
+        cx.notify();
+    }
+
+    fn step_tab(&mut self, backwards: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| Some(&tab.path) == self.open.as_ref())
+        else {
+            return;
+        };
+        let count = self.tabs.len();
+        let next = if backwards {
+            (index + count - 1) % count
+        } else {
+            (index + 1) % count
+        };
+        self.open_note(self.tabs[next].path.clone(), window, cx);
+    }
+
+    fn tab_bar(&self, theme: Theme, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        if self.tabs.is_empty() {
+            return None;
+        }
+        let tabs = self.tabs.iter().enumerate().map(|(index, tab)| {
+            let path = tab.path.clone();
+            let close_path = path.clone();
+            let active = self.open.as_ref() == Some(&path) && !self.settings_open;
+            let title = notes::title(&path);
+            let duplicate = self
+                .tabs
+                .iter()
+                .any(|other| other.path != path && notes::title(&other.path) == title);
+            let mut title = if duplicate {
+                self.settings
+                    .folder
+                    .as_ref()
+                    .map_or(title.clone(), |root| notes::link_title(&path, root))
+            } else {
+                title
+            };
+            if active && (self.dirty || self.conflict.is_some()) {
+                title.push_str(" *");
+            }
+            div()
+                .id(("tab", index))
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .max_w(px(240.))
+                .rounded_md()
+                .cursor_pointer()
+                .text_color(if active { theme.text } else { theme.muted })
+                .when(active, |tab| tab.bg(theme.sheet))
+                .hover(|tab| tab.bg(theme.hover))
+                .child(div().min_w_0().truncate().child(title))
+                .child(
+                    div()
+                        .id(("close-tab", index))
+                        .flex_none()
+                        .font_family(ICON_FONT)
+                        .text_size(px(10.))
+                        .rounded_sm()
+                        .px_1()
+                        .hover(|button| button.bg(theme.hover).text_color(theme.text))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.close_tab(&close_path, window, cx);
+                        }))
+                        .child("\u{e8bb}"),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.open_note(path.clone(), window, cx);
+                }))
+        });
+        Some(
+            div()
+                .id("tabs")
+                .flex()
+                .flex_none()
+                .gap_1()
+                .w_full()
+                .overflow_x_scroll()
+                .children(tabs),
+        )
     }
 
     fn navigation_target(&self, back: bool) -> Option<usize> {
@@ -734,10 +903,7 @@ impl Wevren {
             self.refresh_find(false, cx);
             self.editor.focus_handle(cx).focus(window);
         } else {
-            self.open = None;
-            self.find = None;
-            self.rename_editor = None;
-            self.focus.focus(window);
+            self.close_tab(&path, window, cx);
         }
         self.error = None;
         cx.notify();
@@ -987,6 +1153,11 @@ impl Wevren {
                         visited.clone_from(&renamed);
                     }
                 }
+                for tab in &mut self.tabs {
+                    if tab.path == path {
+                        tab.path.clone_from(&renamed);
+                    }
+                }
                 self.open = Some(renamed);
                 self.baseline = Some(text.clone());
                 self.disk_revision = self.disk_revision.wrapping_add(1);
@@ -1080,6 +1251,12 @@ impl Wevren {
                 self.save(cx);
             }
             "n" => self.new_note(window, cx),
+            "tab" => self.step_tab(modifiers.shift, window, cx),
+            "w" => {
+                if let Some(path) = self.open.clone() {
+                    self.close_tab(&path, window, cx);
+                }
+            }
             _ => return,
         }
         cx.notify();
@@ -1705,7 +1882,17 @@ impl Render for Wevren {
                     .px_2()
                     .pb_2()
                     .when(has_folder, |body| body.child(self.sidebar(theme, cx)))
-                    .child(page),
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .gap_2()
+                            .children(self.tab_bar(theme, cx))
+                            .child(page),
+                    ),
             )
             .children(error)
             .children(self.switcher_page(theme, cx))
