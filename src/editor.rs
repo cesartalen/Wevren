@@ -66,6 +66,12 @@ pub struct Edited;
 #[derive(Clone, Debug)]
 pub struct Followed(pub String);
 
+#[derive(Clone, Copy, Debug)]
+pub struct Submitted;
+
+#[derive(Clone, Copy, Debug)]
+pub struct Cancelled;
+
 /// A hard line of text laid out at the current width.
 #[derive(Clone, Debug)]
 struct Row {
@@ -85,6 +91,7 @@ struct Row {
 pub struct Editor {
     text: SharedString,
     history: History,
+    single_line: bool,
     /// Selected bytes, empty when there is only a caret.
     selection: Range<usize>,
     /// Whether the caret sits at the start of the selection.
@@ -109,6 +116,10 @@ impl EventEmitter<Edited> for Editor {}
 
 impl EventEmitter<Followed> for Editor {}
 
+impl EventEmitter<Submitted> for Editor {}
+
+impl EventEmitter<Cancelled> for Editor {}
+
 impl Focusable for Editor {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus.clone()
@@ -121,6 +132,7 @@ impl Editor {
         Self {
             text: SharedString::default(),
             history: History::default(),
+            single_line: false,
             selection: 0..0,
             reversed: false,
             marked: None,
@@ -133,6 +145,14 @@ impl Editor {
             origin: Point::default(),
             line_height: Pixels::ZERO,
         }
+    }
+
+    pub fn single_line(text: String, cx: &mut Context<Self>) -> Self {
+        let mut editor = Self::new(cx);
+        editor.single_line = true;
+        editor.set_text(text, cx);
+        editor.selection = 0..editor.text.len();
+        editor
     }
 
     /// Returns the text being edited.
@@ -182,6 +202,13 @@ impl Editor {
 
     /// Replaces `range` with `text` and places the caret after it.
     fn replace(&mut self, range: Range<usize>, text: &str, cx: &mut Context<Self>) {
+        let normalized;
+        let text = if self.single_line {
+            normalized = text.replace(['\r', '\n', '\t'], " ");
+            normalized.as_str()
+        } else {
+            text
+        };
         if self.text[range.clone()] == *text {
             return;
         }
@@ -371,6 +398,8 @@ impl Editor {
         // AltGr reports as control and alt together, and must keep typing characters.
         let command = modifiers.secondary() && !modifiers.alt;
         match key.as_str() {
+            "enter" if self.single_line => cx.emit(Submitted),
+            "escape" if self.single_line => cx.emit(Cancelled),
             "z" if command => self.restore_history(modifiers.shift, cx),
             "y" if command => self.restore_history(true, cx),
             "left" if command => self.move_to(previous_word(&self.text, caret), select, cx),
@@ -420,6 +449,9 @@ impl Editor {
 
     /// Returns the ranges to decorate and their colors: composed text, or else the links.
     fn spans(&self, style: &TextStyle, accent: Rgba) -> Vec<(Range<usize>, Hsla)> {
+        if self.single_line && self.marked.is_none() {
+            return Vec::new();
+        }
         match &self.marked {
             Some(marked) => vec![(marked.clone(), style.color)],
             None => links(&self.text)
@@ -430,6 +462,9 @@ impl Editor {
 
     /// Returns the title of the note linked at `offset`, the link's edges included.
     fn link_at(&self, offset: usize) -> Option<&str> {
+        if self.single_line {
+            return None;
+        }
         let link = links(&self.text).find(|link| link.start <= offset && offset <= link.end)?;
         let target = self.text[link.start + 2..link.end - 2]
             .split(['|', '#'])

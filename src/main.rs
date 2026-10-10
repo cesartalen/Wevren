@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 
-use editor::{Edited, Editor, Followed};
+use editor::{Cancelled, Edited, Editor, Followed, Submitted};
 use gpui::{
     AnyElement, App, Application, Bounds, Div, Entity, Focusable, KeyDownEvent, PathPromptOptions,
     Rgba, SharedString, Stateful, Task, TitlebarOptions, Window, WindowBounds, WindowControlArea,
@@ -61,8 +61,9 @@ struct Wevren {
     /// The note shown in the editor.
     open: Option<PathBuf>,
     editor: Entity<Editor>,
-    /// Pending write of the open note, present while it has unsaved edits.
     autosave: Option<Task<anyhow::Result<()>>>,
+    dirty: bool,
+    rename_editor: Option<Entity<Editor>>,
 }
 
 impl Wevren {
@@ -75,7 +76,10 @@ impl Wevren {
             this.follow(&link.0, window, cx);
         })
         .detach();
-        cx.on_release(|this, cx| this.save(cx)).detach();
+        cx.on_release(|this, cx| {
+            this.save(cx);
+        })
+        .detach();
         let mut this = Self {
             settings: Settings::load(),
             settings_open: false,
@@ -84,6 +88,8 @@ impl Wevren {
             open: None,
             editor,
             autosave: None,
+            dirty: false,
+            rename_editor: None,
         };
         this.reload();
         this
@@ -129,8 +135,11 @@ impl Wevren {
     /// Stores `folder` as the notes folder, keeping the settings open on failure.
     fn set_folder(&mut self, folder: PathBuf, cx: &App) {
         self.error = None;
-        self.save(cx);
+        if !self.save(cx) {
+            return;
+        }
         self.open = None;
+        self.rename_editor = None;
         self.settings.folder = Some(folder);
         self.report(self.settings.save());
         self.settings_open |= self.error.is_some();
@@ -140,12 +149,16 @@ impl Wevren {
     /// Shows the note at `path` in the editor.
     fn open_note(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.error = None;
-        self.save(cx);
+        if !self.save(cx) {
+            cx.notify();
+            return;
+        }
         if let Some(text) = self.report(notes::read(&path)) {
             self.editor
                 .update(cx, |editor, cx| editor.set_text(text, cx));
             self.editor.focus_handle(cx).focus(window);
             self.open = Some(path);
+            self.rename_editor = None;
             self.settings_open = false;
         }
         cx.notify();
@@ -153,6 +166,7 @@ impl Wevren {
 
     /// Writes the open note once typing has paused.
     fn schedule_save(&mut self, cx: &mut Context<Self>) {
+        self.dirty = true;
         self.autosave = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(AUTOSAVE_DELAY).await;
             this.update(cx, |this, cx| {
@@ -163,13 +177,67 @@ impl Wevren {
     }
 
     /// Writes the open note now if it has unsaved edits.
-    fn save(&mut self, cx: &App) {
-        if self.autosave.take().is_some()
-            && let Some(path) = &self.open
-        {
-            let written = fs::write(path, self.editor.read(cx).text());
-            self.report(written);
+    fn save(&mut self, cx: &App) -> bool {
+        self.autosave.take();
+        if !self.dirty {
+            return true;
         }
+        let Some(path) = &self.open else {
+            return false;
+        };
+        let written = fs::write(path, self.editor.read(cx).text());
+        if self.report(written).is_none() {
+            return false;
+        }
+        self.dirty = false;
+        true
+    }
+
+    fn begin_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = &self.open else {
+            return;
+        };
+        if self.rename_editor.is_none() {
+            let title = notes::title(path);
+            let input = cx.new(|cx| Editor::single_line(title, cx));
+            cx.subscribe_in(&input, window, |this, _, _: &Submitted, window, cx| {
+                this.finish_rename(window, cx);
+            })
+            .detach();
+            cx.subscribe_in(&input, window, |this, _, _: &Cancelled, window, cx| {
+                this.cancel_rename(window, cx);
+            })
+            .detach();
+            self.rename_editor = Some(input);
+        }
+        if let Some(input) = &self.rename_editor {
+            input.focus_handle(cx).focus(window);
+        }
+        self.settings_open = false;
+        cx.notify();
+    }
+
+    fn cancel_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.rename_editor = None;
+        self.editor.focus_handle(cx).focus(window);
+        cx.notify();
+    }
+
+    fn finish_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(path), Some(input)) = (&self.open, &self.rename_editor) else {
+            return;
+        };
+        let path = path.clone();
+        let title = input.read(cx).text().trim().to_owned();
+        self.error = None;
+        if self.save(cx)
+            && let Some(renamed) = self.report(notes::rename(&path, &title))
+        {
+            self.open = Some(renamed);
+            self.reload();
+            self.cancel_rename(window, cx);
+        }
+        cx.notify();
     }
 
     /// Creates an empty note and opens it.
@@ -210,12 +278,19 @@ impl Wevren {
 
     /// Handles the platform's shortcuts for saving and for a new note.
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key == "f2" {
+            self.begin_rename(window, cx);
+            cx.stop_propagation();
+            return;
+        }
         let modifiers = event.keystroke.modifiers;
         if !modifiers.secondary() || modifiers.alt {
             return;
         }
         match event.keystroke.key.as_str() {
-            "s" => self.save(cx),
+            "s" => {
+                self.save(cx);
+            }
             "n" => self.new_note(window, cx),
             _ => return,
         }
@@ -295,12 +370,61 @@ impl Wevren {
     }
 
     /// Returns the page a note is read and edited on.
-    fn note_page(&self, path: &Path, theme: Theme, cx: &App) -> AnyElement {
+    fn note_page(&self, path: &Path, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
+        let title = if let Some(input) = &self.rename_editor {
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(label("RENAME NOTE", theme))
+                .child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .border_1()
+                        .border_color(theme.accent)
+                        .rounded_md()
+                        .child(input.clone()),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_4()
+                        .font_family(theme.ui_font)
+                        .child(
+                            div()
+                                .id("confirm-rename")
+                                .cursor_pointer()
+                                .text_color(theme.accent)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.finish_rename(window, cx);
+                                }))
+                                .child("Rename"),
+                        )
+                        .child(
+                            div()
+                                .id("cancel-rename")
+                                .cursor_pointer()
+                                .text_color(theme.muted)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.cancel_rename(window, cx);
+                                }))
+                                .child("Cancel"),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            heading(notes::title(path), theme)
+                .id("note-title")
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, window, cx| this.begin_rename(window, cx)))
+                .into_any_element()
+        };
         let column = column()
             .min_h_full()
             .pb_8()
             .line_height(relative(1.7))
-            .child(heading(notes::title(path), theme))
+            .child(title)
             .child(rule(theme))
             .child(self.editor.clone());
         sheet(theme)
