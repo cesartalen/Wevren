@@ -8,6 +8,7 @@ mod links;
 mod markdown;
 mod notes;
 mod search;
+mod session;
 mod settings;
 mod theme;
 mod window_controls;
@@ -129,6 +130,7 @@ struct Wevren {
     content_search: Option<Task<anyhow::Result<()>>>,
     move_picker: bool,
     layout: PaneLayout,
+    last_session: Option<session::Session>,
 }
 
 impl Wevren {
@@ -137,6 +139,7 @@ impl Wevren {
         let editor = Self::note_editor(window, cx);
         cx.on_release(|this, cx| {
             this.save_all(cx);
+            this.persist_session(cx);
         })
         .detach();
         let mut this = Self {
@@ -166,9 +169,15 @@ impl Wevren {
             content_search: None,
             move_picker: false,
             layout: PaneLayout::default(),
+            last_session: None,
         };
         this.reload(cx);
-        this.focus.focus(window);
+        this.restore_session(window, cx);
+        if this.open.is_some() {
+            this.editor.focus_handle(cx).focus(window);
+        } else {
+            this.focus.focus(window);
+        }
         this.start_watcher(cx);
         let view = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
@@ -203,6 +212,98 @@ impl Wevren {
         })
         .detach();
         editor
+    }
+
+    fn restore_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.settings.folder.clone() else {
+            return;
+        };
+        let Some(Some(mut saved)) = self.report(session::Session::load(&root)) else {
+            return;
+        };
+        let folders: Vec<_> = std::iter::once(root.clone())
+            .chain(
+                self.entries
+                    .iter()
+                    .filter(|entry| entry.directory)
+                    .map(|entry| entry.path.clone()),
+            )
+            .collect();
+        saved.sanitize(&self.notes, &folders);
+        for tab in &saved.tabs {
+            let Some(text) = self.report(notes::read(&tab.path)) else {
+                continue;
+            };
+            let editor = Self::note_editor(window, cx);
+            editor.update(cx, |editor, cx| {
+                editor.set_text(text.clone(), cx);
+                editor.restore_view(&tab.view, cx);
+            });
+            self.tabs.push(Tab {
+                path: tab.path.clone(),
+                editor,
+                baseline: Some(text),
+                dirty: false,
+                conflict: None,
+            });
+        }
+        let active_had_note = saved.panes[saved.active].is_some();
+        self.layout = PaneLayout {
+            split: saved.split,
+            active: saved.active,
+            paths: saved
+                .panes
+                .clone()
+                .map(|path| path.filter(|path| self.tabs.iter().any(|tab| tab.path == *path))),
+        };
+        if active_had_note
+            && self.layout.paths[self.layout.active].is_none()
+            && self.layout.paths[1 - self.layout.active].is_some()
+        {
+            self.layout.active = 1 - self.layout.active;
+        }
+        if let Some(path) = &self.layout.paths[self.layout.active]
+            && let Some(index) = self.tabs.iter().position(|tab| tab.path == *path)
+        {
+            self.load_tab_state(index);
+            if let Some(path) = self.open.clone() {
+                self.record_visit(path);
+            }
+        }
+        self.expanded = saved.expanded.iter().cloned().collect();
+        self.selected_folder.clone_from(&saved.selected_folder);
+        self.last_session = Some(saved);
+        self.sync_entries(cx);
+    }
+
+    fn persist_session(&mut self, cx: &App) {
+        let Some(root) = &self.settings.folder else {
+            return;
+        };
+        if !root.is_dir() {
+            return;
+        }
+        let mut expanded: Vec<_> = self.expanded.iter().cloned().collect();
+        expanded.sort();
+        let saved = session::Session {
+            folder: root.clone(),
+            tabs: self
+                .tabs
+                .iter()
+                .map(|tab| session::SavedTab {
+                    path: tab.path.clone(),
+                    view: tab.editor.read(cx).session_view(),
+                })
+                .collect(),
+            panes: self.layout.paths.clone(),
+            split: self.layout.split,
+            active: self.layout.active,
+            expanded,
+            selected_folder: self.selected_folder.clone(),
+        };
+        if self.last_session.as_ref() != Some(&saved) && self.report(saved.save()).is_some() {
+            self.last_session = Some(saved);
+        }
     }
 
     fn store_active_tab(&mut self) {
@@ -363,6 +464,7 @@ impl Wevren {
 
     fn prepare_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let saved = self.save_all(cx);
+        self.persist_session(cx);
         if !saved {
             self.settings_open = false;
             self.editor.focus_handle(cx).focus(window);
@@ -377,7 +479,8 @@ impl Wevren {
         self.watcher = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
-                let (root, paths, revision) = this.update(cx, |this, _| {
+                let (root, paths, revision) = this.update(cx, |this, cx| {
+                    this.persist_session(cx);
                     (
                         this.settings.folder.clone(),
                         this.tabs
@@ -931,6 +1034,7 @@ impl Wevren {
         self.folder_input = None;
         self.settings.folder = Some(folder);
         self.report(self.settings.save());
+        self.persist_session(cx);
         self.settings_open |= self.error.is_some();
         self.reload(cx);
     }

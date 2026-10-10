@@ -234,6 +234,40 @@ impl Editor {
         }
     }
 
+    pub fn session_view(&self) -> crate::session::View {
+        let scroll = self.scroll.offset();
+        crate::session::View {
+            selection: self.selection.clone(),
+            reversed: self.reversed,
+            scroll: [f32::from(scroll.x), f32::from(scroll.y)]
+                .map(|offset| if offset.is_finite() { offset } else { 0. }),
+        }
+    }
+
+    pub fn restore_view(&mut self, view: &crate::session::View, cx: &mut Context<Self>) {
+        let boundary = |offset: usize| {
+            let mut offset = offset.min(self.text.len());
+            while !self.text.is_char_boundary(offset) {
+                offset -= 1;
+            }
+            offset
+        };
+        let start = boundary(view.selection.start);
+        let end = boundary(view.selection.end);
+        self.selection = start.min(end)..start.max(end);
+        self.reversed = view.reversed;
+        let [x, y] = view.scroll.map(|offset| {
+            if offset.is_finite() {
+                offset.min(0.)
+            } else {
+                0.
+            }
+        });
+        self.scroll.set_offset(point(px(x), px(y)));
+        self.reveal = false;
+        cx.notify();
+    }
+
     fn refresh_completion(&mut self) {
         if self.single_line || !self.selection.is_empty() || self.marked.is_some() {
             self.completion = None;

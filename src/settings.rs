@@ -39,6 +39,6 @@ impl Settings {
 }
 
 /// Returns the folder Wevren keeps its own files in.
-fn dir() -> Option<PathBuf> {
+pub(crate) fn dir() -> Option<PathBuf> {
     dirs::config_dir().map(|dir| dir.join("wevren"))
 }
