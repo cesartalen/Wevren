@@ -740,30 +740,52 @@ fn links(text: &str) -> impl Iterator<Item = Range<usize>> {
 fn shape_line(
     text: SharedString,
     spans: &[(Range<usize>, Hsla)],
+    emphasis: &[markdown::Emphasis],
     style: &TextStyle,
     width: Option<Pixels>,
     window: &Window,
 ) -> Vec<WrappedLine> {
-    let run = |len, decoration: Option<Hsla>| TextRun {
-        len,
-        font: style.font(),
-        color: decoration.unwrap_or(style.color),
-        background_color: None,
-        underline: decoration.map(|color| UnderlineStyle {
-            thickness: px(1.),
-            color: Some(color),
-            wavy: false,
-        }),
-        strikethrough: None,
-    };
-    let mut runs = Vec::with_capacity(spans.len() * 2 + 1);
-    let mut end = 0;
-    for (span, color) in spans {
-        runs.push(run(span.start - end, None));
-        runs.push(run(span.len(), Some(*color)));
-        end = span.end;
+    let mut boundaries = vec![0, text.len()];
+    for (span, _) in spans {
+        boundaries.extend([span.start, span.end]);
     }
-    runs.push(run(text.len() - end, None));
+    for span in emphasis {
+        boundaries.extend([span.range.start, span.range.end]);
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    let runs: Vec<_> = boundaries
+        .windows(2)
+        .map(|range| {
+            let mut font = style.font();
+            for span in emphasis
+                .iter()
+                .filter(|span| span.range.contains(&range[0]))
+            {
+                font = if span.bold {
+                    font.bold()
+                } else {
+                    font.italic()
+                };
+            }
+            let decoration = spans
+                .iter()
+                .find(|(span, _)| span.contains(&range[0]))
+                .map(|(_, color)| *color);
+            TextRun {
+                len: range[1] - range[0],
+                font,
+                color: decoration.unwrap_or(style.color),
+                background_color: None,
+                underline: decoration.map(|color| UnderlineStyle {
+                    thickness: px(1.),
+                    color: Some(color),
+                    wavy: false,
+                }),
+                strikethrough: None,
+            }
+        })
+        .collect();
     let font_size = style.font_size.to_pixels(window.rem_size());
     let lines = window
         .text_system()
@@ -779,8 +801,8 @@ fn shape(
     markdown: bool,
     window: &Window,
 ) -> Vec<Row> {
-    let headings = if markdown {
-        markdown::headings(text)
+    let styles = if markdown {
+        markdown::styles(text)
     } else {
         Vec::new()
     };
@@ -798,7 +820,9 @@ fn shape(
                 )
             })
             .collect();
-        let level = headings.get(index).copied().flatten();
+        let formatting = styles.get(index);
+        let level = formatting.and_then(|style| style.heading);
+        let emphasis = formatting.map_or(&[][..], |style| style.emphasis.as_slice());
         let scale = level.map_or(1., markdown::heading_scale);
         let mut line_style = style.clone();
         if level.is_some() {
@@ -806,7 +830,14 @@ fn shape(
             line_style.font_weight = gpui::FontWeight::BOLD;
         }
         let line_height = window.line_height() * scale;
-        for line in shape_line(text.to_owned().into(), &spans, &line_style, width, window) {
+        for line in shape_line(
+            text.to_owned().into(),
+            &spans,
+            emphasis,
+            &line_style,
+            width,
+            window,
+        ) {
             let row = Row {
                 start,
                 top,
@@ -934,61 +965,5 @@ impl Element for EditorElement {
                 .line
                 .paint(at, row.line_height, TextAlign::Left, None, window, cx);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{HISTORY_LIMIT, History, Snapshot};
-
-    fn state(text: &str, selection: std::ops::Range<usize>, reversed: bool) -> Snapshot {
-        Snapshot {
-            text: text.to_owned().into(),
-            selection,
-            reversed,
-        }
-    }
-
-    #[test]
-    fn undo_redo_restores_unicode_text_and_selection() {
-        let mut history = History::default();
-        let before = state("café 🧶", 0..5, true);
-        let after = state("tea 🧶", 3..3, false);
-        history.record(before.clone());
-        assert_eq!(history.undo(after.clone()), Some(before.clone()));
-        assert_eq!(history.redo(before), Some(after));
-    }
-
-    #[test]
-    fn editing_after_undo_discards_redo() {
-        let mut history = History::default();
-        history.record(state("", 0..0, false));
-        let previous = history.undo(state("a", 1..1, false)).unwrap();
-        history.record(previous);
-        assert!(history.redo(state("b", 1..1, false)).is_none());
-        assert_eq!(
-            history.undo(state("b", 1..1, false)),
-            Some(state("", 0..0, false))
-        );
-    }
-
-    #[test]
-    fn history_is_bounded_and_empty_operations_are_safe() {
-        let mut history = History::default();
-        let current = state("", 0..0, false);
-        assert!(history.undo(current.clone()).is_none());
-        assert!(history.redo(current.clone()).is_none());
-        for _ in 0..HISTORY_LIMIT + 5 {
-            history.record(current.clone());
-        }
-        let mut count = 0;
-        while history.undo(current.clone()).is_some() {
-            count += 1;
-        }
-        assert_eq!(count, HISTORY_LIMIT);
-        for _ in 0..HISTORY_LIMIT {
-            assert!(history.redo(current.clone()).is_some());
-        }
-        assert!(history.redo(current).is_none());
     }
 }

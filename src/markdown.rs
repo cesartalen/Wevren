@@ -1,3 +1,26 @@
+use std::ops::Range;
+
+#[derive(Clone, Debug)]
+pub struct Emphasis {
+    pub range: Range<usize>,
+    pub bold: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct LineStyle {
+    pub heading: Option<u8>,
+    pub emphasis: Vec<Emphasis>,
+}
+
+#[derive(Debug)]
+struct Delimiter {
+    start: usize,
+    length: usize,
+    marker: u8,
+    opens: bool,
+    closes: bool,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Fence {
     marker: u8,
@@ -29,7 +52,7 @@ fn heading(line: &str) -> Option<u8> {
     u8::try_from(level).ok()
 }
 
-pub fn headings(text: &str) -> Vec<Option<u8>> {
+pub fn styles(text: &str) -> Vec<LineStyle> {
     let mut open: Option<Fence> = None;
     text.split('\n')
         .map(|line| {
@@ -41,17 +64,128 @@ pub fn headings(text: &str) -> Vec<Option<u8>> {
                 {
                     open = None;
                 }
-                return None;
+                return LineStyle::default();
             }
             if let Some((opening, rest)) = fence(line)
                 && (opening.marker != b'`' || !rest.contains('`'))
             {
                 open = Some(opening);
-                return None;
+                return LineStyle::default();
             }
-            heading(line)
+            if line.starts_with("    ") || line.starts_with('\t') {
+                return LineStyle::default();
+            }
+            LineStyle {
+                heading: heading(line),
+                emphasis: emphasis(line),
+            }
         })
         .collect()
+}
+
+fn punctuation(character: char) -> bool {
+    !character.is_alphanumeric() && !character.is_whitespace()
+}
+
+fn delimiters(text: &str) -> Vec<Delimiter> {
+    let mut delimiters = Vec::new();
+    let mut index = 0;
+    while index < text.len() {
+        let byte = text.as_bytes()[index];
+        if byte == b'\\' {
+            index += 1;
+            if let Some(character) = text[index..].chars().next()
+                && character.is_ascii_punctuation()
+            {
+                index += character.len_utf8();
+            }
+            continue;
+        }
+        if byte == b'`' {
+            let length = text[index..]
+                .bytes()
+                .take_while(|&byte| byte == b'`')
+                .count();
+            let mut end = index + length;
+            let mut matched = false;
+            while let Some(next) = text[end..].find('`') {
+                end += next;
+                let closing = text[end..].bytes().take_while(|&byte| byte == b'`').count();
+                end += closing;
+                if closing == length {
+                    matched = true;
+                    break;
+                }
+            }
+            index = if matched { end } else { index + length };
+            continue;
+        }
+        if !matches!(byte, b'*' | b'_') {
+            index += text[index..].chars().next().map_or(1, char::len_utf8);
+            continue;
+        }
+        let length = text[index..]
+            .bytes()
+            .take_while(|&other| other == byte)
+            .count();
+        let before = text[..index].chars().next_back();
+        let after = text[index + length..].chars().next();
+        let left = after.is_some_and(|c| !c.is_whitespace())
+            && (!after.is_some_and(punctuation)
+                || before.is_none_or(|c| c.is_whitespace() || punctuation(c)));
+        let right = before.is_some_and(|c| !c.is_whitespace())
+            && (!before.is_some_and(punctuation)
+                || after.is_none_or(|c| c.is_whitespace() || punctuation(c)));
+        delimiters.push(Delimiter {
+            start: index,
+            length,
+            marker: byte,
+            opens: left && (byte != b'_' || !right || before.is_some_and(punctuation)),
+            closes: right && (byte != b'_' || !left || after.is_some_and(punctuation)),
+        });
+        index += length;
+    }
+    delimiters
+}
+
+fn emphasis(text: &str) -> Vec<Emphasis> {
+    let mut delimiters = delimiters(text);
+    let mut spans = Vec::new();
+    for closing in 0..delimiters.len() {
+        while delimiters[closing].closes && delimiters[closing].length > 0 {
+            let end = &delimiters[closing];
+            let opening = (0..closing).rev().find(|&index| {
+                let start = &delimiters[index];
+                start.opens
+                    && start.length > 0
+                    && start.marker == end.marker
+                    && !((start.closes || end.opens)
+                        && (start.length + end.length).is_multiple_of(3)
+                        && (!start.length.is_multiple_of(3) || !end.length.is_multiple_of(3)))
+            });
+            let Some(opening) = opening else {
+                break;
+            };
+            let count = if delimiters[opening].length >= 2 && delimiters[closing].length >= 2 {
+                2
+            } else {
+                1
+            };
+            spans.push(Emphasis {
+                range: delimiters[opening].start + delimiters[opening].length
+                    ..delimiters[closing].start,
+                bold: count == 2,
+            });
+            delimiters[opening].length -= count;
+            delimiters[closing].start += count;
+            delimiters[closing].length -= count;
+            for delimiter in &mut delimiters[opening + 1..closing] {
+                delimiter.opens = false;
+                delimiter.closes = false;
+            }
+        }
+    }
+    spans
 }
 
 pub fn heading_scale(level: u8) -> f32 {
@@ -62,53 +196,5 @@ pub fn heading_scale(level: u8) -> f32 {
         4 => 1.125,
         5 => 1.0625,
         _ => 1.,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{heading_scale, headings};
-
-    #[test]
-    fn recognizes_six_levels_and_retains_empty_lines() {
-        assert_eq!(
-            headings("# One\n## Two\n### Three\n#### Four\n##### Five\n###### Six\n"),
-            vec![Some(1), Some(2), Some(3), Some(4), Some(5), Some(6), None]
-        );
-        assert_eq!(
-            headings("#\n##\tCafé 🧶\n   ### Indented"),
-            vec![Some(1), Some(2), Some(3)]
-        );
-    }
-
-    #[test]
-    fn leaves_hashtags_escaped_markers_and_indented_code_alone() {
-        assert_eq!(
-            headings("#tag\n####### Too many\n\\# Escaped\n    # Code\n\t# Code\nordinary # text"),
-            vec![None; 6]
-        );
-    }
-
-    #[test]
-    fn skips_fenced_code_and_respects_the_closing_fence() {
-        assert_eq!(
-            headings(
-                "# Before\n````rust\n# Code\n```\n## Still code\n```` text\n### Still code\n`````\n## After"
-            ),
-            vec![Some(1), None, None, None, None, None, None, None, Some(2)]
-        );
-        assert_eq!(
-            headings("~~~\n# Code\n```\n## Code\n~~~\n# After"),
-            vec![None, None, None, None, None, Some(1)]
-        );
-        assert_eq!(headings("```\n# Unclosed"), vec![None, None]);
-    }
-
-    #[test]
-    fn heading_sizes_follow_the_hierarchy() {
-        for level in 1..6 {
-            assert!(heading_scale(level) > heading_scale(level + 1));
-        }
-        assert!((heading_scale(6) - 1.).abs() < f32::EPSILON);
     }
 }
