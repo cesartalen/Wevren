@@ -75,7 +75,7 @@ struct Switcher {
     scroll: gpui::ScrollHandle,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Conflict {
     disk: Option<String>,
 }
@@ -84,6 +84,16 @@ struct Conflict {
 struct Tab {
     path: PathBuf,
     editor: Entity<Editor>,
+    baseline: Option<String>,
+    dirty: bool,
+    conflict: Option<Conflict>,
+}
+
+#[derive(Debug, Default)]
+struct PaneLayout {
+    split: bool,
+    paths: [Option<PathBuf>; 2],
+    active: usize,
 }
 
 /// The root view.
@@ -118,6 +128,7 @@ struct Wevren {
     tabs: Vec<Tab>,
     content_search: Option<Task<anyhow::Result<()>>>,
     move_picker: bool,
+    layout: PaneLayout,
 }
 
 impl Wevren {
@@ -125,7 +136,7 @@ impl Wevren {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let editor = Self::note_editor(window, cx);
         cx.on_release(|this, cx| {
-            this.save(cx);
+            this.save_all(cx);
         })
         .detach();
         let mut this = Self {
@@ -154,43 +165,207 @@ impl Wevren {
             tabs: Vec::new(),
             content_search: None,
             move_picker: false,
+            layout: PaneLayout::default(),
         };
         this.reload(cx);
         this.focus.focus(window);
         this.start_watcher(cx);
         let view = cx.entity().downgrade();
-        window.on_window_should_close(cx, move |_, cx| {
-            view.update(cx, Self::prepare_close).unwrap_or(true)
+        window.on_window_should_close(cx, move |window, cx| {
+            view.update(cx, |this, cx| this.prepare_close(window, cx))
+                .unwrap_or(true)
         });
         this
     }
 
     fn note_editor(window: &mut Window, cx: &mut Context<Self>) -> Entity<Editor> {
         let editor = cx.new(Editor::new);
-        cx.subscribe(&editor, |this, source, _: &Edited, cx| {
-            if this.editor == source {
-                this.schedule_save(cx);
-                this.refresh_find(false, cx);
-            }
+        cx.subscribe_in(&editor, window, |this, source, _: &Edited, window, cx| {
+            this.select_editor(source, window, cx);
+            this.schedule_save(cx);
+            this.refresh_find(false, cx);
         })
         .detach();
         cx.subscribe_in(
             &editor,
             window,
             |this, source, link: &Followed, window, cx| {
-                if this.editor == *source {
-                    this.follow(&link.0, window, cx);
-                }
+                this.select_editor(source, window, cx);
+                this.follow(&link.0, window, cx);
             },
         )
+        .detach();
+        let source = editor.downgrade();
+        cx.on_focus(&editor.focus_handle(cx), window, move |this, window, cx| {
+            if let Some(source) = source.upgrade() {
+                this.select_editor(&source, window, cx);
+            }
+        })
         .detach();
         editor
     }
 
-    fn prepare_close(&mut self, cx: &mut Context<Self>) -> bool {
-        let saved = self.save(cx);
+    fn store_active_tab(&mut self) {
+        if let Some(tab) = self
+            .tabs
+            .iter_mut()
+            .find(|tab| Some(&tab.path) == self.open.as_ref())
+        {
+            tab.baseline.clone_from(&self.baseline);
+            tab.conflict.clone_from(&self.conflict);
+            tab.dirty = self.dirty;
+        }
+    }
+
+    fn load_tab_state(&mut self, index: usize) {
+        let tab = &self.tabs[index];
+        self.open = Some(tab.path.clone());
+        self.editor = tab.editor.clone();
+        self.baseline.clone_from(&tab.baseline);
+        self.conflict.clone_from(&tab.conflict);
+        self.dirty = tab.dirty;
+        if self.layout.split
+            && self.layout.paths[1 - self.layout.active].as_ref() == Some(&tab.path)
+        {
+            self.layout.active = 1 - self.layout.active;
+        }
+        self.layout.paths[self.layout.active].clone_from(&self.open);
+        self.selected_folder = tab.path.parent().map(Path::to_path_buf);
+        self.find = None;
+        self.rename_editor = None;
+        self.settings_open = false;
+        self.disk_revision = self.disk_revision.wrapping_add(1);
+        self.reveal_open();
+    }
+
+    fn select_editor(
+        &mut self,
+        source: &Entity<Editor>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editor == *source && self.open.is_some() {
+            return;
+        }
+        let Some(index) = self.tabs.iter().position(|tab| tab.editor == *source) else {
+            return;
+        };
+        self.save(cx);
+        self.store_active_tab();
+        self.editor.update(cx, |editor, cx| {
+            editor.set_matches(Vec::new(), None, false, cx);
+        });
+        self.load_tab_state(index);
+        if let Some(path) = self.open.clone() {
+            self.record_visit(path);
+        }
+        cx.notify();
+    }
+
+    fn select_pane(&mut self, pane: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = &self.layout.paths[pane]
+            && let Some(tab) = self.tabs.iter().find(|tab| tab.path == *path)
+        {
+            let editor = tab.editor.clone();
+            self.select_editor(&editor, window, cx);
+            self.layout.active = pane;
+            editor.focus_handle(cx).focus(window);
+        } else {
+            self.save(cx);
+            self.store_active_tab();
+            self.layout.active = pane;
+            self.open = None;
+            self.baseline = None;
+            self.conflict = None;
+            self.dirty = false;
+            self.find = None;
+            self.rename_editor = None;
+            self.disk_revision = self.disk_revision.wrapping_add(1);
+            self.focus.focus(window);
+        }
+        self.settings_open = false;
+        cx.notify();
+    }
+
+    fn toggle_split(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.store_active_tab();
+        if self.layout.split {
+            let keep = self
+                .open
+                .clone()
+                .or_else(|| self.layout.paths[1 - self.layout.active].clone());
+            self.layout.split = false;
+            self.layout.paths = [keep, None];
+            self.layout.active = 0;
+            if self.open.is_none() {
+                self.select_pane(0, window, cx);
+            }
+        } else {
+            self.layout.split = true;
+            self.layout.paths[0].clone_from(&self.open);
+            self.layout.paths[1] = self
+                .tabs
+                .iter()
+                .find(|tab| Some(&tab.path) != self.open.as_ref())
+                .map(|tab| tab.path.clone());
+            self.select_pane(1, window, cx);
+        }
+        cx.notify();
+    }
+
+    fn save_all(&mut self, cx: &App) -> bool {
+        let active_saved = self.save(cx);
+        self.store_active_tab();
+        let mut failed = if active_saved {
+            None
+        } else {
+            self.tabs
+                .iter()
+                .position(|tab| Some(&tab.path) == self.open.as_ref())
+        };
+        for index in 0..self.tabs.len() {
+            let tab = &self.tabs[index];
+            if Some(&tab.path) == self.open.as_ref() {
+                continue;
+            }
+            if tab.conflict.is_some() {
+                failed.get_or_insert(index);
+                continue;
+            }
+            if !tab.dirty {
+                continue;
+            }
+            let path = tab.path.clone();
+            let text = tab.editor.read(cx).text().to_owned();
+            let baseline = tab.baseline.clone();
+            match self.report(notes::write_if_unchanged(&path, baseline.as_deref(), &text)) {
+                Some(true) => {
+                    self.tabs[index].baseline = Some(text);
+                    self.tabs[index].dirty = false;
+                }
+                Some(false) => {
+                    if let Some(disk) = self.report(notes::disk_text(&path)) {
+                        self.tabs[index].conflict = Some(Conflict { disk });
+                    }
+                    failed.get_or_insert(index);
+                }
+                None => {
+                    failed.get_or_insert(index);
+                }
+            }
+        }
+        if let Some(index) = failed {
+            self.load_tab_state(index);
+            return false;
+        }
+        active_saved
+    }
+
+    fn prepare_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let saved = self.save_all(cx);
         if !saved {
             self.settings_open = false;
+            self.editor.focus_handle(cx).focus(window);
             self.error
                 .get_or_insert_with(|| "Resolve unsaved changes before closing Wevren.".into());
             cx.notify();
@@ -202,10 +377,13 @@ impl Wevren {
         self.watcher = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
-                let (root, path, revision) = this.update(cx, |this, _| {
+                let (root, paths, revision) = this.update(cx, |this, _| {
                     (
                         this.settings.folder.clone(),
-                        this.open.clone(),
+                        this.tabs
+                            .iter()
+                            .map(|tab| tab.path.clone())
+                            .collect::<Vec<_>>(),
                         this.disk_revision,
                     )
                 })?;
@@ -213,18 +391,22 @@ impl Wevren {
                     continue;
                 };
                 let scan_root = root.clone();
-                let scan_path = path.clone();
                 let (entries, disk) = cx
                     .background_executor()
                     .spawn(async move {
                         let entries = notes::scan(&scan_root);
-                        let disk = scan_path.as_deref().map(notes::disk_text).transpose();
+                        let disk: Vec<_> = paths
+                            .into_iter()
+                            .map(|path| {
+                                let text = notes::disk_text(&path);
+                                (path, text)
+                            })
+                            .collect();
                         (entries, disk)
                     })
                     .await;
                 this.update(cx, |this, cx| {
                     if this.settings.folder.as_ref() != Some(&root)
-                        || this.open != path
                         || this.disk_revision != revision
                     {
                         return;
@@ -239,14 +421,44 @@ impl Wevren {
                         Err(error) => this.watch_error(&error, cx),
                         _ => {}
                     }
-                    match disk {
-                        Ok(Some(disk)) => this.apply_disk(disk, cx),
-                        Err(error) => this.watch_error(&error, cx),
-                        Ok(None) => {}
+                    for (path, text) in disk {
+                        match text {
+                            Ok(disk) if this.open.as_ref() == Some(&path) => {
+                                this.apply_disk(disk, cx);
+                            }
+                            Ok(disk) => this.apply_inactive_disk(&path, disk, cx),
+                            Err(error) => this.watch_error(&error, cx),
+                        }
                     }
+                    this.store_active_tab();
                 })?;
             }
         }));
+    }
+
+    fn apply_inactive_disk(&mut self, path: &Path, disk: Option<String>, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.path == path) else {
+            return;
+        };
+        if tab.baseline == disk {
+            if tab.conflict.take().is_some() {
+                cx.notify();
+            }
+        } else if tab.dirty || disk.is_none() || tab.conflict.is_some() {
+            if tab
+                .conflict
+                .as_ref()
+                .is_none_or(|conflict| conflict.disk != disk)
+            {
+                tab.conflict = Some(Conflict { disk });
+                cx.notify();
+            }
+        } else if let Some(text) = disk {
+            tab.baseline = Some(text.clone());
+            tab.editor
+                .update(cx, |editor, cx| editor.reload_text(text, cx));
+            cx.notify();
+        }
     }
 
     fn watch_error(&mut self, error: &io::Error, cx: &mut Context<Self>) {
@@ -384,6 +596,7 @@ impl Wevren {
     }
 
     fn refresh_content_search(&mut self, cx: &mut Context<Self>) {
+        self.store_active_tab();
         self.content_search.take();
         let Some(switcher) = &mut self.switcher else {
             return;
@@ -400,10 +613,12 @@ impl Wevren {
             return;
         }
         let paths = self.notes.clone();
-        let open = self
-            .open
-            .clone()
-            .map(|path| (path, self.editor.read(cx).text().to_owned()));
+        let open: Vec<_> = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.dirty || tab.conflict.is_some())
+            .map(|tab| (tab.path.clone(), tab.editor.read(cx).text().to_owned()))
+            .collect();
         self.content_search = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(150))
@@ -411,7 +626,7 @@ impl Wevren {
             let search_query = query.clone();
             let hits = cx
                 .background_executor()
-                .spawn(async move { workspace_search::find(&paths, &search_query, open.as_ref()) })
+                .spawn(async move { workspace_search::find(&paths, &search_query, &open) })
                 .await;
             this.update(cx, |this, cx| {
                 if let Some(switcher) = &mut this.switcher
@@ -659,8 +874,15 @@ impl Wevren {
                 .collect()
         });
         self.editor.update(cx, |editor, cx| {
-            editor.set_note_titles(titles, cx);
+            editor.set_note_titles(titles.clone(), cx);
         });
+        for tab in &self.tabs {
+            if tab.editor != self.editor {
+                tab.editor.update(cx, |editor, cx| {
+                    editor.set_note_titles(titles.clone(), cx);
+                });
+            }
+        }
     }
 
     /// Asks for a folder and keeps the notes in it from then on.
@@ -686,7 +908,7 @@ impl Wevren {
     /// Stores `folder` as the notes folder, keeping the settings open on failure.
     fn set_folder(&mut self, folder: PathBuf, cx: &mut App) {
         self.error = None;
-        if !self.save(cx) {
+        if !self.save_all(cx) {
             self.settings_open = false;
             return;
         }
@@ -700,6 +922,9 @@ impl Wevren {
         self.navigation.clear();
         self.navigation_index = None;
         self.tabs.clear();
+        self.layout.split = false;
+        self.layout.paths = [None, None];
+        self.layout.active = 0;
         self.move_picker = false;
         self.entries.clear();
         self.selected_folder = Some(folder.clone());
@@ -723,25 +948,19 @@ impl Wevren {
         cx: &mut Context<Self>,
     ) -> bool {
         self.error = None;
-        if !self.save(cx) {
-            self.settings_open = false;
-            cx.notify();
-            return false;
-        }
+        self.save(cx);
+        self.store_active_tab();
         if self.activate_tab(&path, window, cx) {
             self.disk_revision = self.disk_revision.wrapping_add(1);
             self.editor.focus_handle(cx).focus(window);
-            if record
-                && self
-                    .navigation_index
-                    .is_none_or(|index| self.navigation[index] != path)
-            {
-                self.navigation
-                    .truncate(self.navigation_index.map_or(0, |index| index + 1));
-                self.navigation.push(path.clone());
-                self.navigation_index = Some(self.navigation.len() - 1);
+            if record {
+                self.record_visit(path.clone());
             }
             self.open = Some(path);
+            if self.layout.split && self.layout.paths[1 - self.layout.active] == self.open {
+                self.layout.active = 1 - self.layout.active;
+            }
+            self.layout.paths[self.layout.active].clone_from(&self.open);
             self.selected_folder = self
                 .open
                 .as_ref()
@@ -755,6 +974,18 @@ impl Wevren {
         }
         cx.notify();
         false
+    }
+
+    fn record_visit(&mut self, path: PathBuf) {
+        if self
+            .navigation_index
+            .is_none_or(|index| self.navigation[index] != path)
+        {
+            self.navigation
+                .truncate(self.navigation_index.map_or(0, |index| index + 1));
+            self.navigation.push(path);
+            self.navigation_index = Some(self.navigation.len() - 1);
+        }
     }
 
     fn activate_tab(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -773,22 +1004,32 @@ impl Wevren {
             self.tabs[index].editor.clone()
         } else {
             let editor = Self::note_editor(window, cx);
+            editor.update(cx, |editor, cx| {
+                editor.set_text(disk.clone().unwrap_or_default(), cx);
+            });
             self.tabs.push(Tab {
                 path: path.to_path_buf(),
                 editor: editor.clone(),
+                baseline: disk.clone(),
+                dirty: false,
+                conflict: None,
             });
             editor
         };
-        self.baseline.clone_from(&disk);
-        self.conflict = None;
-        if let Some(text) = disk {
-            if self.editor.read(cx).text() != text {
-                self.editor
-                    .update(cx, |editor, cx| editor.reload_text(text, cx));
-            }
-        } else {
-            self.conflict = Some(Conflict { disk: None });
+        let index = existing.unwrap_or(self.tabs.len() - 1);
+        self.baseline.clone_from(&self.tabs[index].baseline);
+        self.conflict.clone_from(&self.tabs[index].conflict);
+        self.dirty = self.tabs[index].dirty;
+        if !self.dirty
+            && self.conflict.is_none()
+            && disk == self.baseline
+            && let Some(text) = &disk
+            && self.editor.read(cx).text() != text
+        {
+            self.editor
+                .update(cx, |editor, cx| editor.reload_text(text.clone(), cx));
         }
+        self.apply_disk(disk, cx);
         self.sync_entries(cx);
         true
     }
@@ -797,13 +1038,25 @@ impl Wevren {
         let Some(index) = self.tabs.iter().position(|tab| tab.path == path) else {
             return;
         };
+        if self.open.as_deref() != Some(path)
+            && (self.tabs[index].dirty || self.tabs[index].conflict.is_some())
+        {
+            let editor = self.tabs[index].editor.clone();
+            self.select_editor(&editor, window, cx);
+        }
         let active = self.open.as_deref() == Some(path);
         if active && !self.save(cx) {
             self.settings_open = false;
+            self.editor.focus_handle(cx).focus(window);
             cx.notify();
             return;
         }
         self.tabs.remove(index);
+        for pane in &mut self.layout.paths {
+            if pane.as_deref() == Some(path) {
+                *pane = None;
+            }
+        }
         if active {
             self.open = None;
             self.baseline = None;
@@ -838,7 +1091,7 @@ impl Wevren {
     }
 
     fn tab_bar(&self, theme: Theme, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
-        if self.tabs.is_empty() {
+        if self.tabs.is_empty() && !self.layout.split {
             return None;
         }
         let tabs = self.tabs.iter().enumerate().map(|(index, tab)| {
@@ -858,7 +1111,10 @@ impl Wevren {
             } else {
                 title
             };
-            if active && (self.dirty || self.conflict.is_some()) {
+            if (active && (self.dirty || self.conflict.is_some()))
+                || tab.dirty
+                || tab.conflict.is_some()
+            {
                 title.push_str(" *");
             }
             div()
@@ -904,7 +1160,23 @@ impl Wevren {
                 .gap_1()
                 .w_full()
                 .overflow_x_scroll()
-                .children(tabs),
+                .children(tabs)
+                .child(
+                    div()
+                        .id("split-panes")
+                        .flex_none()
+                        .px_3()
+                        .py_2()
+                        .cursor_pointer()
+                        .text_color(theme.muted)
+                        .hover(|button| button.text_color(theme.accent))
+                        .on_click(cx.listener(|this, _, window, cx| this.toggle_split(window, cx)))
+                        .child(if self.layout.split {
+                            "Close split"
+                        } else {
+                            "Split"
+                        }),
+                ),
         )
     }
 
@@ -985,6 +1257,7 @@ impl Wevren {
     /// Writes the open note once typing has paused.
     fn schedule_save(&mut self, cx: &mut Context<Self>) {
         self.dirty = true;
+        self.store_active_tab();
         self.disk_revision = self.disk_revision.wrapping_add(1);
         if self.conflict.is_some() {
             return;
@@ -1291,7 +1564,7 @@ impl Wevren {
             return;
         };
         self.error = None;
-        if self.save(cx) {
+        if self.save_all(cx) {
             let baseline = self.baseline.clone().unwrap_or_default();
             if let Some((renamed, text)) =
                 self.report(links::rename(&root, &path, &title, &baseline))
@@ -1315,6 +1588,11 @@ impl Wevren {
                 visited.clone_from(&path);
             }
         }
+        for pane in &mut self.layout.paths {
+            if pane.as_deref() == Some(old) {
+                *pane = Some(path.clone());
+            }
+        }
         self.tabs.retain(|tab| tab.path != path || tab.path == old);
         for tab in &mut self.tabs {
             if tab.path == old {
@@ -1334,6 +1612,7 @@ impl Wevren {
         self.reveal_open();
         self.move_picker = false;
         self.cancel_rename(window, cx);
+        self.store_active_tab();
     }
 
     fn begin_move(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1359,7 +1638,7 @@ impl Wevren {
             return;
         };
         self.error = None;
-        if self.save(cx) {
+        if self.save_all(cx) {
             let baseline = self.baseline.clone().unwrap_or_default();
             if let Some((moved, text)) =
                 self.report(links::move_note(&root, &path, folder, &baseline))
@@ -1588,6 +1867,7 @@ impl Wevren {
                 self.save(cx);
             }
             "n" => self.new_note(window, cx),
+            "backslash" | "\\" => self.toggle_split(window, cx),
             "m" if modifiers.shift => self.begin_move(window, cx),
             "tab" => self.step_tab(modifiers.shift, window, cx),
             "w" => {
@@ -1803,9 +2083,15 @@ impl Wevren {
             }))
     }
 
-    /// Returns the page a note is read and edited on.
-    fn note_page(&self, path: &Path, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
-        let title = if let Some(input) = &self.rename_editor {
+    fn note_title(
+        &self,
+        path: &Path,
+        pane: usize,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let active = pane == self.layout.active;
+        if let Some(input) = self.rename_editor.as_ref().filter(|_| active) {
             div()
                 .flex()
                 .flex_col()
@@ -1849,11 +2135,27 @@ impl Wevren {
                 .into_any_element()
         } else {
             heading(notes::title(path), theme)
-                .id("note-title")
+                .id(("note-title", pane))
                 .cursor_pointer()
-                .on_click(cx.listener(|this, _, window, cx| this.begin_rename(window, cx)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.select_pane(pane, window, cx);
+                    this.begin_rename(window, cx);
+                }))
                 .into_any_element()
-        };
+        }
+    }
+
+    /// Returns the page a note is read and edited on.
+    fn note_page(
+        &self,
+        path: &Path,
+        editor: &Entity<Editor>,
+        pane: usize,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let active = pane == self.layout.active;
+        let title = self.note_title(path, pane, theme, cx);
         let column = column()
             .min_h_full()
             .pb_8()
@@ -1865,26 +2167,27 @@ impl Wevren {
                     .justify_between()
                     .gap_4()
                     .child(div().flex_1().min_w_0().child(title))
-                    .when(self.rename_editor.is_none(), |row| {
+                    .when(!active || self.rename_editor.is_none(), |row| {
                         row.child(
                             div()
-                                .id("move-note")
+                                .id(("move-note", pane))
                                 .flex_none()
                                 .text_size(px(12.))
                                 .text_color(theme.muted)
                                 .cursor_pointer()
                                 .hover(|button| button.text_color(theme.accent))
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| this.begin_move(window, cx)),
-                                )
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.select_pane(pane, window, cx);
+                                    this.begin_move(window, cx);
+                                }))
                                 .child("Move"),
                         )
                     }),
             )
             .child(rule(theme))
-            .child(self.editor.clone());
+            .child(editor.clone());
         let scroll = div()
-            .id("note")
+            .id(("note", pane))
             .flex()
             .flex_col()
             .flex_1()
@@ -1892,15 +2195,66 @@ impl Wevren {
             .w_full()
             .items_center()
             .overflow_y_scroll()
-            .track_scroll(self.editor.read(cx).scroll_handle())
+            .track_scroll(editor.read(cx).scroll_handle())
             .child(column);
         sheet(theme)
-            .children(self.conflict_bar(theme, cx))
-            .when(self.find.is_some(), |sheet| {
+            .children(active.then(|| self.conflict_bar(theme, cx)).flatten())
+            .when(active && self.find.is_some(), |sheet| {
                 sheet.child(self.find_bar(theme, cx))
             })
             .child(scroll)
             .into_any_element()
+    }
+
+    fn pane_page(&self, pane: usize, theme: Theme, cx: &mut Context<Self>) -> Stateful<Div> {
+        let tab = self.layout.paths[pane]
+            .as_ref()
+            .and_then(|path| self.tabs.iter().find(|tab| tab.path == *path));
+        let content = tab.map_or_else(
+            || empty_page(theme),
+            |tab| self.note_page(&tab.path, &tab.editor, pane, theme, cx),
+        );
+        div()
+            .id(("pane", pane))
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .gap_1()
+            .when(self.layout.split, |view| {
+                view.child(
+                    div()
+                        .id(("pane-header", pane))
+                        .px_3()
+                        .py_1()
+                        .cursor_pointer()
+                        .text_size(px(11.))
+                        .text_color(if pane == self.layout.active {
+                            theme.accent
+                        } else {
+                            theme.muted
+                        })
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.select_pane(pane, window, cx);
+                        }))
+                        .child(format!(
+                            "{} pane{}",
+                            if pane == 0 { "Left" } else { "Right" },
+                            if tab.is_some_and(|tab| tab.dirty || tab.conflict.is_some()) {
+                                " (unsaved changes)"
+                            } else {
+                                ""
+                            }
+                        )),
+                )
+            })
+            .when(tab.is_none(), |view| {
+                view.on_click(
+                    cx.listener(move |this, _, window, cx| this.select_pane(pane, window, cx)),
+                )
+            })
+            .child(content)
     }
 
     fn find_bar(&self, theme: Theme, cx: &mut Context<Self>) -> Div {
@@ -2115,7 +2469,7 @@ fn titlebar(
                 .cursor_pointer()
                 .on_click(cx.listener(|this, _, window, cx| {
                     cx.stop_propagation();
-                    if this.prepare_close(cx) {
+                    if this.prepare_close(window, cx) {
                         window.remove_window();
                     }
                 })),
@@ -2218,12 +2572,23 @@ fn empty_page(theme: Theme) -> AnyElement {
 
 impl Render for Wevren {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.store_active_tab();
         let theme = *cx.global::<Theme>();
         let has_folder = self.settings.folder.is_some();
-        let page = match &self.open {
-            _ if self.settings_open || !has_folder => self.settings_page(theme, cx),
-            Some(path) => self.note_page(path, theme, cx),
-            None => empty_page(theme),
+        let page = if self.settings_open || !has_folder {
+            self.settings_page(theme, cx)
+        } else {
+            div()
+                .flex()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .gap_2()
+                .child(self.pane_page(0, theme, cx))
+                .when(self.layout.split, |view| {
+                    view.child(self.pane_page(1, theme, cx))
+                })
+                .into_any_element()
         };
         let error = self
             .error

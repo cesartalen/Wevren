@@ -36,13 +36,13 @@ impl Results {
     }
 }
 
-pub fn find(paths: &[PathBuf], query: &str, open: Option<&(PathBuf, String)>) -> Results {
+pub fn find(paths: &[PathBuf], query: &str, open: &[(PathBuf, String)]) -> Results {
     let mut results = Results::default();
     if query.is_empty() {
         return results;
     }
     for path in paths {
-        let text = if let Some((_, text)) = open.filter(|(current, _)| current == path) {
+        let text = if let Some((_, text)) = open.iter().find(|(current, _)| current == path) {
             text.clone()
         } else if let Ok(text) = notes::read(path) {
             text
