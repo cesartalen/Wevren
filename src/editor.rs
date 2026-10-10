@@ -1,6 +1,6 @@
 //! A plain-text editor for the body of a note.
 
-use std::{mem, ops::Range, panic::Location};
+use std::{collections::VecDeque, mem, ops::Range, panic::Location};
 
 use gpui::{
     App, AvailableSpace, Bounds, ClipboardItem, ElementId, ElementInputHandler, Entity,
@@ -20,6 +20,43 @@ const CARET_WIDTH: Pixels = px(1.5);
 const BREAK_WIDTH: Pixels = px(6.);
 /// Opacity of the selection, letting the text stay readable through it.
 const SELECTION_ALPHA: f32 = 0.25;
+
+const HISTORY_LIMIT: usize = 200;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Snapshot {
+    text: SharedString,
+    selection: Range<usize>,
+    reversed: bool,
+}
+
+#[derive(Debug, Default)]
+struct History {
+    undo: VecDeque<Snapshot>,
+    redo: Vec<Snapshot>,
+}
+
+impl History {
+    fn record(&mut self, state: Snapshot) {
+        if self.undo.len() == HISTORY_LIMIT {
+            self.undo.pop_front();
+        }
+        self.undo.push_back(state);
+        self.redo.clear();
+    }
+
+    fn undo(&mut self, current: Snapshot) -> Option<Snapshot> {
+        let previous = self.undo.pop_back()?;
+        self.redo.push(current);
+        Some(previous)
+    }
+
+    fn redo(&mut self, current: Snapshot) -> Option<Snapshot> {
+        let next = self.redo.pop()?;
+        self.undo.push_back(current);
+        Some(next)
+    }
+}
 
 /// Emitted whenever editing changes the text.
 #[derive(Clone, Copy, Debug)]
@@ -47,6 +84,7 @@ struct Row {
 )]
 pub struct Editor {
     text: SharedString,
+    history: History,
     /// Selected bytes, empty when there is only a caret.
     selection: Range<usize>,
     /// Whether the caret sits at the start of the selection.
@@ -82,6 +120,7 @@ impl Editor {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             text: SharedString::default(),
+            history: History::default(),
             selection: 0..0,
             reversed: false,
             marked: None,
@@ -111,6 +150,7 @@ impl Editor {
     /// Replaces the whole text without emitting [`Edited`], as when a note is opened.
     pub fn set_text(&mut self, text: String, cx: &mut Context<Self>) {
         self.text = text.into();
+        self.history = History::default();
         self.selection = 0..0;
         self.reversed = false;
         self.marked = None;
@@ -142,6 +182,12 @@ impl Editor {
 
     /// Replaces `range` with `text` and places the caret after it.
     fn replace(&mut self, range: Range<usize>, text: &str, cx: &mut Context<Self>) {
+        if self.text[range.clone()] == *text {
+            return;
+        }
+        if self.marked.is_none() {
+            self.history.record(self.snapshot());
+        }
         let caret = range.start + text.len();
         let mut edited = self.text.to_string();
         edited.replace_range(range, text);
@@ -152,6 +198,34 @@ impl Editor {
         self.reveal = true;
         cx.emit(Edited);
         cx.notify();
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            text: self.text.clone(),
+            selection: self.selection.clone(),
+            reversed: self.reversed,
+        }
+    }
+
+    fn restore_history(&mut self, redo: bool, cx: &mut Context<Self>) {
+        let current = self.snapshot();
+        let state = if redo {
+            self.history.redo(current)
+        } else {
+            self.history.undo(current)
+        };
+        if let Some(state) = state {
+            self.text = state.text;
+            self.selection = state.selection;
+            self.reversed = state.reversed;
+            self.marked = None;
+            self.selecting = false;
+            self.over_link = false;
+            self.reveal = true;
+            cx.emit(Edited);
+            cx.notify();
+        }
     }
 
     /// Replaces the selection with `text`.
@@ -297,6 +371,8 @@ impl Editor {
         // AltGr reports as control and alt together, and must keep typing characters.
         let command = modifiers.secondary() && !modifiers.alt;
         match key.as_str() {
+            "z" if command => self.restore_history(modifiers.shift, cx),
+            "y" if command => self.restore_history(true, cx),
             "left" if command => self.move_to(previous_word(&self.text, caret), select, cx),
             "right" if command => self.move_to(next_word(&self.text, caret), select, cx),
             "home" if command => self.move_to(0, select, cx),
@@ -526,6 +602,7 @@ impl EntityInputHandler for Editor {
         cx: &mut Context<Self>,
     ) {
         self.replace(self.input_range(range.as_ref()), text, cx);
+        self.marked = None;
     }
 
     fn replace_and_mark_text_in_range(
@@ -751,5 +828,61 @@ impl Element for EditorElement {
                 .line
                 .paint(at, line_height, TextAlign::Left, None, window, cx);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HISTORY_LIMIT, History, Snapshot};
+
+    fn state(text: &str, selection: std::ops::Range<usize>, reversed: bool) -> Snapshot {
+        Snapshot {
+            text: text.to_owned().into(),
+            selection,
+            reversed,
+        }
+    }
+
+    #[test]
+    fn undo_redo_restores_unicode_text_and_selection() {
+        let mut history = History::default();
+        let before = state("café 🧶", 0..5, true);
+        let after = state("tea 🧶", 3..3, false);
+        history.record(before.clone());
+        assert_eq!(history.undo(after.clone()), Some(before.clone()));
+        assert_eq!(history.redo(before), Some(after));
+    }
+
+    #[test]
+    fn editing_after_undo_discards_redo() {
+        let mut history = History::default();
+        history.record(state("", 0..0, false));
+        let previous = history.undo(state("a", 1..1, false)).unwrap();
+        history.record(previous);
+        assert!(history.redo(state("b", 1..1, false)).is_none());
+        assert_eq!(
+            history.undo(state("b", 1..1, false)),
+            Some(state("", 0..0, false))
+        );
+    }
+
+    #[test]
+    fn history_is_bounded_and_empty_operations_are_safe() {
+        let mut history = History::default();
+        let current = state("", 0..0, false);
+        assert!(history.undo(current.clone()).is_none());
+        assert!(history.redo(current.clone()).is_none());
+        for _ in 0..HISTORY_LIMIT + 5 {
+            history.record(current.clone());
+        }
+        let mut count = 0;
+        while history.undo(current.clone()).is_some() {
+            count += 1;
+        }
+        assert_eq!(count, HISTORY_LIMIT);
+        for _ in 0..HISTORY_LIMIT {
+            assert!(history.redo(current.clone()).is_some());
+        }
+        assert!(history.redo(current).is_none());
     }
 }
