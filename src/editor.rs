@@ -4,11 +4,11 @@ use std::{mem, ops::Range, panic::Location};
 
 use gpui::{
     App, AvailableSpace, Bounds, ClipboardItem, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, InspectorElementId,
-    KeyDownEvent, Keystroke, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, PaintQuad,
-    Pixels, Point, Rgba, ScrollHandle, SharedString, Style, TextAlign, TextRun, TextStyle,
-    UTF16Selection, UnderlineStyle, Window, WrappedLine, div, fill, point, prelude::*, px,
-    relative, size,
+    EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, Hsla,
+    InspectorElementId, KeyDownEvent, Keystroke, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Rgba, ScrollHandle, SharedString,
+    Style, TextAlign, TextRun, TextStyle, UTF16Selection, UnderlineStyle, Window, WrappedLine, div,
+    fill, point, prelude::*, px, relative, size,
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 
@@ -25,6 +25,10 @@ const SELECTION_ALPHA: f32 = 0.25;
 #[derive(Clone, Copy, Debug)]
 pub struct Edited;
 
+/// Emitted with the title of the linked note when a link is followed.
+#[derive(Clone, Debug)]
+pub struct Followed(pub String);
+
 /// A hard line of text laid out at the current width.
 #[derive(Clone, Debug)]
 struct Row {
@@ -37,6 +41,10 @@ struct Row {
 
 /// Editable, soft-wrapped plain text.
 #[derive(Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the flags are independent of each other"
+)]
 pub struct Editor {
     text: SharedString,
     /// Selected bytes, empty when there is only a caret.
@@ -47,6 +55,8 @@ pub struct Editor {
     marked: Option<Range<usize>>,
     /// Whether a mouse drag is extending the selection.
     selecting: bool,
+    /// Whether the pointer is over a link.
+    over_link: bool,
     /// Whether the next frame must scroll the caret into view.
     reveal: bool,
     focus: FocusHandle,
@@ -58,6 +68,8 @@ pub struct Editor {
 }
 
 impl EventEmitter<Edited> for Editor {}
+
+impl EventEmitter<Followed> for Editor {}
 
 impl Focusable for Editor {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -74,6 +86,7 @@ impl Editor {
             reversed: false,
             marked: None,
             selecting: false,
+            over_link: false,
             reveal: false,
             focus: cx.focus_handle(),
             scroll: ScrollHandle::new(),
@@ -300,6 +313,11 @@ impl Editor {
             "end" => self.move_to(self.near_caret(Some(Pixels::MAX), 0.), select, cx),
             "backspace" => self.delete(self.previous(caret)..caret, cx),
             "delete" => self.delete(caret..self.next(caret), cx),
+            "enter" if command => {
+                if let Some(target) = self.link_at(caret) {
+                    cx.emit(Followed(target.to_owned()));
+                }
+            }
             "enter" => self.insert("\n", cx),
             "tab" => self.insert("\t", cx),
             "a" if command => {
@@ -324,6 +342,36 @@ impl Editor {
         cx.stop_propagation();
     }
 
+    /// Returns the ranges to decorate and their colors: composed text, or else the links.
+    fn spans(&self, style: &TextStyle, accent: Rgba) -> Vec<(Range<usize>, Hsla)> {
+        match &self.marked {
+            Some(marked) => vec![(marked.clone(), style.color)],
+            None => links(&self.text)
+                .map(|link| (link, accent.into()))
+                .collect(),
+        }
+    }
+
+    /// Returns the title of the note linked at `offset`, the link's edges included.
+    fn link_at(&self, offset: usize) -> Option<&str> {
+        let link = links(&self.text).find(|link| link.start <= offset && offset <= link.end)?;
+        let target = self.text[link.start + 2..link.end - 2]
+            .split(['|', '#'])
+            .next()?;
+        Some(target.trim()).filter(|target| !target.is_empty())
+    }
+
+    /// Returns the title of the note linked under `position`, relative to the first character.
+    fn link_under(&self, position: Point<Pixels>) -> Option<&str> {
+        let row = self.rows.iter().rfind(|row| row.top <= position.y)?;
+        let local = point(position.x, position.y - row.top);
+        if local.y >= row.line.size(self.line_height).height {
+            return None;
+        }
+        let index = row.line.index_for_position(local, self.line_height).ok()?;
+        self.link_at(row.start + index)
+    }
+
     /// Places the caret under the pointer and starts a drag selection.
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.selecting = true;
@@ -335,11 +383,26 @@ impl Editor {
         );
     }
 
-    /// Extends the selection to the pointer while the button stays down.
+    /// Extends the selection while the button stays down and notes links under the pointer.
     fn mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let position = event.position - self.origin;
         self.selecting &= event.pressed_button == Some(MouseButton::Left);
         if self.selecting {
-            self.move_to(self.offset_at(event.position - self.origin), true, cx);
+            self.move_to(self.offset_at(position), true, cx);
+        }
+        let over_link = self.link_under(position).is_some();
+        if over_link != self.over_link {
+            self.over_link = over_link;
+            cx.notify();
+        }
+    }
+
+    /// Follows the link under the pointer when a click ends without selecting anything.
+    fn mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.selection.is_empty()
+            && let Some(target) = self.link_under(event.position - self.origin)
+        {
+            cx.emit(Followed(target.to_owned()));
         }
     }
 
@@ -516,43 +579,65 @@ impl Render for Editor {
         div()
             .flex_grow()
             .track_focus(&self.focus)
-            .cursor_text()
+            .map(|editor| {
+                if self.over_link {
+                    editor.cursor_pointer()
+                } else {
+                    editor.cursor_text()
+                }
+            })
             .on_key_down(cx.listener(Self::key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_move(cx.listener(Self::mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .child(EditorElement(cx.entity()))
     }
 }
 
-/// Lays `text` out in hard lines wrapped at `width`, underlining the `marked` range.
+/// Returns the ranges of the `[[links]]` in `text`, brackets included.
+fn links(text: &str) -> impl Iterator<Item = Range<usize>> {
+    let mut from = 0;
+    std::iter::from_fn(move || {
+        loop {
+            let open = from + text[from..].find("[[")?;
+            let close = open + text[open..].find("]]")?;
+            if close > open + 2 && !text[open + 2..close].contains(['[', '\n']) {
+                from = close + 2;
+                return Some(open..from);
+            }
+            from = open + 1;
+        }
+    })
+}
+
+/// Lays `text` out in hard lines wrapped at `width`, underlining `spans` in their colors.
 fn shape(
     text: SharedString,
-    marked: Option<&Range<usize>>,
+    spans: &[(Range<usize>, Hsla)],
     style: &TextStyle,
     width: Option<Pixels>,
     window: &Window,
 ) -> Vec<WrappedLine> {
-    let run = |len, underline| TextRun {
+    let run = |len, decoration: Option<Hsla>| TextRun {
         len,
         font: style.font(),
-        color: style.color,
+        color: decoration.unwrap_or(style.color),
         background_color: None,
-        underline,
+        underline: decoration.map(|color| UnderlineStyle {
+            thickness: px(1.),
+            color: Some(color),
+            wavy: false,
+        }),
         strikethrough: None,
     };
-    let composing = UnderlineStyle {
-        thickness: px(1.),
-        color: Some(style.color),
-        wavy: false,
-    };
-    let runs = match marked {
-        Some(marked) => vec![
-            run(marked.start, None),
-            run(marked.len(), Some(composing)),
-            run(text.len() - marked.end, None),
-        ],
-        None => vec![run(text.len(), None)],
-    };
+    let mut runs = Vec::with_capacity(spans.len() * 2 + 1);
+    let mut end = 0;
+    for (span, color) in spans {
+        runs.push(run(span.start - end, None));
+        runs.push(run(span.len(), Some(*color)));
+        end = span.end;
+    }
+    runs.push(run(text.len() - end, None));
     let font_size = style.font_size.to_pixels(window.rem_size());
     let lines = window
         .text_system()
@@ -591,8 +676,9 @@ impl Element for EditorElement {
         cx: &mut App,
     ) -> (LayoutId, ()) {
         let editor = self.0.read(cx);
-        let (text, marked) = (editor.text.clone(), editor.marked.clone());
         let (style, line_height) = (window.text_style(), window.line_height());
+        let spans = editor.spans(&style, cx.global::<Theme>().accent);
+        let text = editor.text.clone();
         let mut layout = Style::default();
         layout.size.width = relative(1.).into();
         let id = window.request_measured_layout(layout, move |known, available, window, _cx| {
@@ -600,7 +686,7 @@ impl Element for EditorElement {
                 AvailableSpace::Definite(width) => Some(width),
                 AvailableSpace::MinContent | AvailableSpace::MaxContent => None,
             });
-            let lines = shape(text.clone(), marked.as_ref(), &style, width, window);
+            let lines = shape(text.clone(), &spans, &style, width, window);
             let height = lines.iter().fold(Pixels::ZERO, |sum, line| {
                 sum + line.size(line_height).height
             });
@@ -618,16 +704,12 @@ impl Element for EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let accent = cx.global::<Theme>().accent;
         self.0.update(cx, |editor, _cx| {
             let width = Some(bounds.size.width);
             let style = window.text_style();
-            let lines = shape(
-                editor.text.clone(),
-                editor.marked.as_ref(),
-                &style,
-                width,
-                window,
-            );
+            let spans = editor.spans(&style, accent);
+            let lines = shape(editor.text.clone(), &spans, &style, width, window);
             editor.layout(lines, bounds.origin, window);
         });
     }

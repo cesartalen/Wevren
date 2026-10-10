@@ -9,12 +9,12 @@ mod theme;
 
 use std::{
     fmt::Display,
-    fs,
+    fs, io,
     path::{Path, PathBuf},
     time::Duration,
 };
 
-use editor::{Edited, Editor};
+use editor::{Edited, Editor, Followed};
 use gpui::{
     AnyElement, App, Application, Bounds, Div, Entity, Focusable, KeyDownEvent, PathPromptOptions,
     Rgba, SharedString, Stateful, Task, TitlebarOptions, Window, WindowBounds, WindowControlArea,
@@ -67,10 +67,14 @@ struct Wevren {
 
 impl Wevren {
     /// Creates the view from the saved settings.
-    fn new(cx: &mut Context<Self>) -> Self {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let editor = cx.new(Editor::new);
         cx.subscribe(&editor, |this, _, _: &Edited, cx| this.schedule_save(cx))
             .detach();
+        cx.subscribe_in(&editor, window, |this, _, link: &Followed, window, cx| {
+            this.follow(&link.0, window, cx);
+        })
+        .detach();
         cx.on_release(|this, cx| this.save(cx)).detach();
         let mut this = Self {
             settings: Settings::load(),
@@ -173,7 +177,31 @@ impl Wevren {
         let Some(folder) = self.settings.folder.clone() else {
             return;
         };
-        if let Some(path) = self.report(notes::create(&folder)) {
+        self.open_created(notes::create_untitled(&folder), window, cx);
+    }
+
+    /// Opens the note titled `title`, creating it when there is none.
+    fn follow(&mut self, title: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(folder) = self.settings.folder.clone() else {
+            return;
+        };
+        let wanted = title.to_lowercase();
+        let mut notes = self.notes.iter();
+        let existing = notes.find(|path| notes::title(path).to_lowercase() == wanted);
+        let path = existing
+            .cloned()
+            .map_or_else(|| notes::create(&folder, title), Ok);
+        self.open_created(path, window, cx);
+    }
+
+    /// Opens the note at `path`, which may have just been created.
+    fn open_created(
+        &mut self,
+        path: io::Result<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(path) = self.report(path) {
             self.reload();
             self.open_note(path, window, cx);
         }
@@ -548,7 +576,7 @@ fn main() {
         };
         cx.open_window(options, |window, cx| {
             cx.set_global(Theme::new(window.appearance()));
-            cx.new(Wevren::new)
+            cx.new(|cx| Wevren::new(window, cx))
         })
         .expect("the main window must open at startup");
         cx.activate(true);

@@ -10,6 +10,22 @@ use std::{
 const EXTENSION: &str = "md";
 /// Title a note carries until it is given one.
 const UNTITLED: &str = "Untitled";
+/// Characters a title cannot contain, as Windows forbids them in file names.
+const FORBIDDEN: [char; 9] = ['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
+
+/// Creates an empty note titled `title` in `folder` and returns its path.
+///
+/// # Errors
+///
+/// Fails when the title cannot be a file name, is taken, or the file cannot be created.
+pub fn create(folder: &Path, title: &str) -> io::Result<PathBuf> {
+    if title.contains(FORBIDDEN) {
+        let message = format!("\"{title}\" cannot be the title of a note");
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
+    }
+    let path = folder.join(format!("{title}.{EXTENSION}"));
+    File::create_new(&path).map(|_| path)
+}
 
 /// Creates an empty note in `folder` and returns its path.
 ///
@@ -18,17 +34,16 @@ const UNTITLED: &str = "Untitled";
 /// # Errors
 ///
 /// Fails when the file cannot be created.
-pub fn create(folder: &Path) -> io::Result<PathBuf> {
+pub fn create_untitled(folder: &Path) -> io::Result<PathBuf> {
     let mut number = 1;
     loop {
         let title = match number {
             1 => UNTITLED.to_owned(),
             _ => format!("{UNTITLED} {number}"),
         };
-        let path = folder.join(format!("{title}.{EXTENSION}"));
-        match File::create_new(&path) {
+        match create(folder, &title) {
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => number += 1,
-            created => return created.map(|_| path),
+            created => return created,
         }
     }
 }
