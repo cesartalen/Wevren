@@ -205,6 +205,21 @@ impl Editor {
         cx.notify();
     }
 
+    pub fn reload_text(&mut self, text: String, cx: &mut Context<Self>) {
+        let selection = self.selection.clone();
+        let scroll = self.scroll.offset();
+        self.set_text(text, cx);
+        let boundary = |offset: usize| {
+            let mut offset = offset.min(self.text.len());
+            while !self.text.is_char_boundary(offset) {
+                offset -= 1;
+            }
+            offset
+        };
+        self.selection = boundary(selection.start)..boundary(selection.end);
+        self.scroll.set_offset(scroll);
+    }
+
     fn refresh_completion(&mut self) {
         if self.single_line || !self.selection.is_empty() || self.marked.is_some() {
             self.completion = None;

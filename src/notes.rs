@@ -2,8 +2,9 @@
 
 use std::{
     fs::{self, File},
-    io,
+    io::{self, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 /// File extension that marks a file as a note.
@@ -12,6 +13,48 @@ const EXTENSION: &str = "md";
 const UNTITLED: &str = "Untitled";
 /// Characters a title cannot contain, as Windows forbids them in file names.
 const FORBIDDEN: [char; 9] = ['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
+
+static NEXT_WRITE: AtomicU64 = AtomicU64::new(0);
+
+pub fn disk_text(path: &Path) -> io::Result<Option<String>> {
+    match read(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn write_if_unchanged(path: &Path, expected: Option<&str>, text: &str) -> io::Result<bool> {
+    if disk_text(path)?.as_deref() != expected {
+        return Ok(false);
+    }
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "the note has no parent folder")
+    })?;
+    let (temporary, mut file) = loop {
+        let number = NEXT_WRITE.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!(".wevren-{}-{number}.tmp", std::process::id()));
+        match File::create_new(&temporary) {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    };
+    let written = (|| {
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        if disk_text(path)?.as_deref() != expected {
+            return Ok(false);
+        }
+        fs::rename(&temporary, path)?;
+        Ok(true)
+    })();
+    if temporary.exists() {
+        let _ = fs::remove_file(temporary);
+    }
+    written
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
@@ -86,8 +129,12 @@ pub fn link_title(path: &Path, root: &Path) -> String {
 }
 
 pub fn resolve(root: &Path, current: &Path, title: &str, notes: &[PathBuf]) -> io::Result<PathBuf> {
+    if let Some(path) = find(root, current, title, notes) {
+        return Ok(path.to_path_buf());
+    }
     let normalized = title.replace('\\', "/");
     if normalized.contains('/') {
+        let normalized = normalized.strip_prefix("./").unwrap_or(&normalized);
         let mut parts: Vec<_> = normalized.split('/').collect();
         let name = parts.pop().unwrap_or_default();
         validate_title(name)?;
@@ -101,12 +148,6 @@ pub fn resolve(root: &Path, current: &Path, title: &str, notes: &[PathBuf]) -> i
                 io::ErrorKind::InvalidInput,
                 "the link must stay in the notes folder",
             ));
-        }
-        if let Some(existing) = notes
-            .iter()
-            .find(|path| link_title(path, root).eq_ignore_ascii_case(&normalized))
-        {
-            return Ok(existing.clone());
         }
         return create(&parent, name);
     }
@@ -125,6 +166,30 @@ pub fn resolve(root: &Path, current: &Path, title: &str, notes: &[PathBuf]) -> i
             "more than one note has that title; use a folder/Note link",
         )),
     }
+}
+
+pub fn find<'a>(
+    root: &Path,
+    current: &Path,
+    target: &str,
+    notes: &'a [PathBuf],
+) -> Option<&'a Path> {
+    let normalized = target.replace('\\', "/");
+    if normalized.contains('/') {
+        let normalized = normalized.strip_prefix("./").unwrap_or(&normalized);
+        return notes
+            .iter()
+            .find(|path| link_title(path, root).eq_ignore_ascii_case(normalized))
+            .map(PathBuf::as_path);
+    }
+    let mut matching = notes
+        .iter()
+        .filter(|path| title(path).to_lowercase() == target.to_lowercase());
+    if let Some(local) = matching.clone().find(|path| path.parent() == Some(current)) {
+        return Some(local);
+    }
+    let first = matching.next()?;
+    matching.next().is_none().then_some(first.as_path())
 }
 
 /// Creates an empty note titled `title` in `folder` and returns its path.
@@ -163,19 +228,24 @@ fn validate_title(title: &str) -> io::Result<()> {
 pub fn rename(path: &Path, title: &str) -> io::Result<PathBuf> {
     validate_title(title)?;
     let target = path.with_file_name(format!("{title}.{EXTENSION}"));
+    rename_to(path, &target)?;
+    Ok(target)
+}
+
+pub fn rename_to(path: &Path, target: &Path) -> io::Result<()> {
     if target == path {
-        return Ok(target);
+        return Ok(());
     }
-    if cfg!(windows) && target.exists() && fs::canonicalize(path)? == fs::canonicalize(&target)? {
-        fs::rename(path, &target)?;
-        return Ok(target);
+    if cfg!(windows) && target.exists() && fs::canonicalize(path)? == fs::canonicalize(target)? {
+        fs::rename(path, target)?;
+        return Ok(());
     }
-    fs::hard_link(path, &target)?;
+    fs::hard_link(path, target)?;
     if let Err(error) = fs::remove_file(path) {
-        let _ = fs::remove_file(&target);
+        let _ = fs::remove_file(target);
         return Err(error);
     }
-    Ok(target)
+    Ok(())
 }
 
 /// Creates an empty note in `folder` and returns its path.
@@ -186,11 +256,15 @@ pub fn rename(path: &Path, title: &str) -> io::Result<PathBuf> {
 ///
 /// Fails when the file cannot be created.
 pub fn create_untitled(folder: &Path) -> io::Result<PathBuf> {
+    create_unique(folder, UNTITLED)
+}
+
+pub fn create_unique(folder: &Path, base: &str) -> io::Result<PathBuf> {
     let mut number = 1;
     loop {
         let title = match number {
-            1 => UNTITLED.to_owned(),
-            _ => format!("{UNTITLED} {number}"),
+            1 => base.to_owned(),
+            _ => format!("{base} {number}"),
         };
         match create(folder, &title) {
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => number += 1,

@@ -8,6 +8,7 @@ pub struct Emphasis {
 
 #[derive(Debug, Default)]
 pub struct LineStyle {
+    pub code: bool,
     pub heading: Option<u8>,
     pub emphasis: Vec<Emphasis>,
 }
@@ -64,18 +65,28 @@ pub fn styles(text: &str) -> Vec<LineStyle> {
                 {
                     open = None;
                 }
-                return LineStyle::default();
+                return LineStyle {
+                    code: true,
+                    ..LineStyle::default()
+                };
             }
             if let Some((opening, rest)) = fence(line)
                 && (opening.marker != b'`' || !rest.contains('`'))
             {
                 open = Some(opening);
-                return LineStyle::default();
+                return LineStyle {
+                    code: true,
+                    ..LineStyle::default()
+                };
             }
             if line.starts_with("    ") || line.starts_with('\t') {
-                return LineStyle::default();
+                return LineStyle {
+                    code: true,
+                    ..LineStyle::default()
+                };
             }
             LineStyle {
+                code: false,
                 heading: heading(line),
                 emphasis: emphasis(line),
             }

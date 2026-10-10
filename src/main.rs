@@ -4,6 +4,7 @@
 
 mod completion;
 mod editor;
+mod links;
 mod markdown;
 mod notes;
 mod search;
@@ -14,7 +15,7 @@ use std::{
     cmp::Reverse,
     collections::HashSet,
     fmt::Display,
-    fs, io,
+    io,
     ops::Range,
     path::{Path, PathBuf},
     time::Duration,
@@ -68,6 +69,11 @@ struct Switcher {
     selected: usize,
 }
 
+#[derive(Debug)]
+struct Conflict {
+    disk: Option<String>,
+}
+
 /// The root view.
 #[derive(Debug)]
 struct Wevren {
@@ -91,6 +97,10 @@ struct Wevren {
     rename_editor: Option<Entity<Editor>>,
     find: Option<Find>,
     switcher: Option<Switcher>,
+    baseline: Option<String>,
+    conflict: Option<Conflict>,
+    disk_revision: u64,
+    watcher: Option<Task<anyhow::Result<()>>>,
 }
 
 impl Wevren {
@@ -127,10 +137,119 @@ impl Wevren {
             rename_editor: None,
             find: None,
             switcher: None,
+            baseline: None,
+            conflict: None,
+            disk_revision: 0,
+            watcher: None,
         };
         this.reload(cx);
         this.focus.focus(window);
+        this.start_watcher(cx);
+        let view = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |_, cx| {
+            view.update(cx, |this, cx| {
+                let saved = this.save(cx);
+                if !saved {
+                    this.settings_open = false;
+                    this.error.get_or_insert_with(|| {
+                        "Resolve unsaved changes before closing Wevren.".into()
+                    });
+                    cx.notify();
+                }
+                saved
+            })
+            .unwrap_or(true)
+        });
         this
+    }
+
+    fn start_watcher(&mut self, cx: &mut Context<Self>) {
+        self.watcher = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let (root, path, revision) = this.update(cx, |this, _| {
+                    (
+                        this.settings.folder.clone(),
+                        this.open.clone(),
+                        this.disk_revision,
+                    )
+                })?;
+                let Some(root) = root else {
+                    continue;
+                };
+                let scan_root = root.clone();
+                let scan_path = path.clone();
+                let (entries, disk) = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let entries = notes::scan(&scan_root);
+                        let disk = scan_path.as_deref().map(notes::disk_text).transpose();
+                        (entries, disk)
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    if this.settings.folder.as_ref() != Some(&root)
+                        || this.open != path
+                        || this.disk_revision != revision
+                    {
+                        return;
+                    }
+                    match entries {
+                        Ok(entries) if entries != this.entries => {
+                            this.entries = entries;
+                            this.sync_entries(cx);
+                            this.refresh_switcher(cx);
+                            cx.notify();
+                        }
+                        Err(error) => this.watch_error(&error, cx),
+                        _ => {}
+                    }
+                    match disk {
+                        Ok(Some(disk)) => this.apply_disk(disk, cx),
+                        Err(error) => this.watch_error(&error, cx),
+                        Ok(None) => {}
+                    }
+                })?;
+            }
+        }));
+    }
+
+    fn watch_error(&mut self, error: &io::Error, cx: &mut Context<Self>) {
+        let message: SharedString = format!("{error}").into();
+        if self.error.as_ref() != Some(&message) {
+            self.error = Some(message);
+            cx.notify();
+        }
+    }
+
+    fn apply_disk(&mut self, disk: Option<String>, cx: &mut Context<Self>) {
+        if disk == self.baseline {
+            if self.conflict.take().is_some() {
+                if self.dirty {
+                    self.schedule_save(cx);
+                }
+                cx.notify();
+            }
+            return;
+        }
+        if self.dirty || disk.is_none() || self.conflict.is_some() {
+            let changed = self
+                .conflict
+                .as_ref()
+                .is_none_or(|conflict| conflict.disk != disk);
+            self.autosave.take();
+            self.conflict = Some(Conflict { disk });
+            if changed {
+                cx.notify();
+            }
+        } else if let Some(text) = disk {
+            self.baseline = Some(text.clone());
+            self.disk_revision = self.disk_revision.wrapping_add(1);
+            self.editor
+                .update(cx, |editor, cx| editor.reload_text(text, cx));
+            self.refresh_find(false, cx);
+            cx.notify();
+        }
     }
 
     fn begin_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -336,6 +455,10 @@ impl Wevren {
         if let Some(entries) = self.report(entries) {
             self.entries = entries.unwrap_or_default();
         }
+        self.sync_entries(cx);
+    }
+
+    fn sync_entries(&mut self, cx: &mut App) {
         self.notes = self
             .entries
             .iter()
@@ -347,6 +470,15 @@ impl Wevren {
                 .iter()
                 .any(|entry| entry.directory && entry.path == *path)
         });
+        if self.selected_folder.as_ref().is_some_and(|path| {
+            Some(path) != self.settings.folder.as_ref()
+                && !self
+                    .entries
+                    .iter()
+                    .any(|entry| entry.directory && entry.path == *path)
+        }) {
+            self.selected_folder.clone_from(&self.settings.folder);
+        }
         let titles = self.settings.folder.as_ref().map_or_else(Vec::new, |root| {
             self.notes
                 .iter()
@@ -382,11 +514,15 @@ impl Wevren {
     fn set_folder(&mut self, folder: PathBuf, cx: &mut App) {
         self.error = None;
         if !self.save(cx) {
+            self.settings_open = false;
             return;
         }
         self.open = None;
         self.rename_editor = None;
         self.find = None;
+        self.baseline = None;
+        self.conflict = None;
+        self.disk_revision = self.disk_revision.wrapping_add(1);
         self.expanded.clear();
         self.entries.clear();
         self.selected_folder = Some(folder.clone());
@@ -401,10 +537,14 @@ impl Wevren {
     fn open_note(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.error = None;
         if !self.save(cx) {
+            self.settings_open = false;
             cx.notify();
             return;
         }
         if let Some(text) = self.report(notes::read(&path)) {
+            self.baseline = Some(text.clone());
+            self.conflict = None;
+            self.disk_revision = self.disk_revision.wrapping_add(1);
             self.editor
                 .update(cx, |editor, cx| editor.set_text(text, cx));
             self.editor.focus_handle(cx).focus(window);
@@ -478,6 +618,10 @@ impl Wevren {
     /// Writes the open note once typing has paused.
     fn schedule_save(&mut self, cx: &mut Context<Self>) {
         self.dirty = true;
+        self.disk_revision = self.disk_revision.wrapping_add(1);
+        if self.conflict.is_some() {
+            return;
+        }
         self.autosave = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(AUTOSAVE_DELAY).await;
             this.update(cx, |this, cx| {
@@ -490,18 +634,165 @@ impl Wevren {
     /// Writes the open note now if it has unsaved edits.
     fn save(&mut self, cx: &App) -> bool {
         self.autosave.take();
+        if self.conflict.is_some() {
+            return false;
+        }
         if !self.dirty {
             return true;
         }
         let Some(path) = &self.open else {
             return false;
         };
-        let written = fs::write(path, self.editor.read(cx).text());
-        if self.report(written).is_none() {
-            return false;
+        let path = path.clone();
+        let text = self.editor.read(cx).text().to_owned();
+        match self.report(notes::write_if_unchanged(
+            &path,
+            self.baseline.as_deref(),
+            &text,
+        )) {
+            Some(true) => {
+                self.baseline = Some(text);
+                self.disk_revision = self.disk_revision.wrapping_add(1);
+            }
+            Some(false) => {
+                if let Some(disk) = self.report(notes::disk_text(&path)) {
+                    self.conflict = Some(Conflict { disk });
+                }
+                return false;
+            }
+            None => return false,
         }
         self.dirty = false;
         true
+    }
+
+    fn reload_conflict(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.open.clone() else {
+            return;
+        };
+        let Some(disk) = self.report(notes::disk_text(&path)) else {
+            cx.notify();
+            return;
+        };
+        self.dirty = false;
+        self.conflict = None;
+        self.baseline.clone_from(&disk);
+        self.disk_revision = self.disk_revision.wrapping_add(1);
+        if let Some(text) = disk {
+            self.editor
+                .update(cx, |editor, cx| editor.reload_text(text, cx));
+            self.refresh_find(false, cx);
+            self.editor.focus_handle(cx).focus(window);
+        } else {
+            self.open = None;
+            self.find = None;
+            self.rename_editor = None;
+            self.focus.focus(window);
+        }
+        self.error = None;
+        cx.notify();
+    }
+
+    fn keep_local(&mut self, cx: &mut Context<Self>) {
+        let (Some(path), Some(conflict)) = (&self.open, &self.conflict) else {
+            return;
+        };
+        let path = path.clone();
+        let expected = conflict.disk.clone();
+        let text = self.editor.read(cx).text().to_owned();
+        match self.report(notes::write_if_unchanged(&path, expected.as_deref(), &text)) {
+            Some(true) => {
+                self.baseline = Some(text);
+                self.conflict = None;
+                self.dirty = false;
+                self.error = None;
+                self.disk_revision = self.disk_revision.wrapping_add(1);
+                self.reload(cx);
+            }
+            Some(false) => {
+                if let Some(disk) = self.report(notes::disk_text(&path)) {
+                    self.conflict = Some(Conflict { disk });
+                }
+                self.error = Some(
+                    "The file changed again. Review the conflict before keeping your version."
+                        .into(),
+                );
+            }
+            None => {}
+        }
+        cx.notify();
+    }
+
+    fn save_conflict_copy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(path), Some(root)) = (&self.open, &self.settings.folder) else {
+            return;
+        };
+        let folder = path
+            .parent()
+            .filter(|parent| parent.is_dir())
+            .unwrap_or(root);
+        let created = notes::create_unique(folder, &format!("{} (conflict)", notes::title(path)));
+        if let Some(copy) = self.report(created) {
+            let text = self.editor.read(cx).text();
+            if self.report(notes::write_if_unchanged(&copy, Some(""), text)) == Some(true) {
+                self.conflict = None;
+                self.dirty = false;
+                self.open_created(Ok(copy), window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn conflict_bar(&self, theme: Theme, cx: &mut Context<Self>) -> Option<Div> {
+        let conflict = self.conflict.as_ref()?;
+        let removed = conflict.disk.is_none();
+        let message = if removed {
+            "This note was removed outside Wevren. Your text is still here."
+        } else {
+            "This note changed outside Wevren. Autosave is paused to protect both versions."
+        };
+        let buttons = [
+            (
+                "conflict-reload",
+                if removed { "Close note" } else { "Reload disk" },
+                0,
+            ),
+            ("conflict-keep", "Keep my version", 1),
+            ("conflict-copy", "Save a copy", 2),
+        ]
+        .into_iter()
+        .map(|(id, label, action)| {
+            div()
+                .id(id)
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .text_color(theme.accent)
+                .hover(|style| style.bg(theme.hover))
+                .on_click(cx.listener(move |this, _, window, cx| match action {
+                    0 => this.reload_conflict(window, cx),
+                    1 => this.keep_local(cx),
+                    _ => this.save_conflict_copy(window, cx),
+                }))
+                .child(label)
+        });
+        Some(
+            div()
+                .flex()
+                .flex_none()
+                .flex_col()
+                .gap_2()
+                .px_4()
+                .py_3()
+                .border_b_1()
+                .border_color(theme.line)
+                .font_family(theme.ui_font)
+                .text_size(px(12.))
+                .text_color(theme.text)
+                .child(message)
+                .child(div().flex().flex_wrap().gap_2().children(buttons)),
+        )
     }
 
     fn begin_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -632,13 +923,24 @@ impl Wevren {
         };
         let path = path.clone();
         let title = input.read(cx).text().trim().to_owned();
+        let Some(root) = self.settings.folder.clone() else {
+            return;
+        };
         self.error = None;
-        if self.save(cx)
-            && let Some(renamed) = self.report(notes::rename(&path, &title))
-        {
-            self.open = Some(renamed);
-            self.reload(cx);
-            self.cancel_rename(window, cx);
+        if self.save(cx) {
+            let baseline = self.baseline.clone().unwrap_or_default();
+            if let Some((renamed, text)) =
+                self.report(links::rename(&root, &path, &title, &baseline))
+            {
+                self.open = Some(renamed);
+                self.baseline = Some(text.clone());
+                self.disk_revision = self.disk_revision.wrapping_add(1);
+                self.editor
+                    .update(cx, |editor, cx| editor.reload_text(text, cx));
+                self.refresh_find(false, cx);
+                self.reload(cx);
+                self.cancel_rename(window, cx);
+            }
         }
         cx.notify();
     }
@@ -980,6 +1282,7 @@ impl Wevren {
             .track_scroll(self.editor.read(cx).scroll_handle())
             .child(column);
         sheet(theme)
+            .children(self.conflict_bar(theme, cx))
             .when(self.find.is_some(), |sheet| {
                 sheet.child(self.find_bar(theme, cx))
             })
