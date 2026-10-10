@@ -5,12 +5,14 @@
 mod editor;
 mod markdown;
 mod notes;
+mod search;
 mod settings;
 mod theme;
 
 use std::{
     fmt::Display,
     fs, io,
+    ops::Range,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -49,6 +51,13 @@ const ADD_GLYPH: &str = "\u{e710}";
 /// Pause after the last edit before a note is written, sparing the disk while typing.
 const AUTOSAVE_DELAY: Duration = Duration::from_secs(1);
 
+#[derive(Debug)]
+struct Find {
+    input: Entity<Editor>,
+    matches: Vec<Range<usize>>,
+    current: Option<usize>,
+}
+
 /// The root view.
 #[derive(Debug)]
 struct Wevren {
@@ -65,14 +74,18 @@ struct Wevren {
     autosave: Option<Task<anyhow::Result<()>>>,
     dirty: bool,
     rename_editor: Option<Entity<Editor>>,
+    find: Option<Find>,
 }
 
 impl Wevren {
     /// Creates the view from the saved settings.
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let editor = cx.new(Editor::new);
-        cx.subscribe(&editor, |this, _, _: &Edited, cx| this.schedule_save(cx))
-            .detach();
+        cx.subscribe(&editor, |this, _, _: &Edited, cx| {
+            this.schedule_save(cx);
+            this.refresh_find(false, cx);
+        })
+        .detach();
         cx.subscribe_in(&editor, window, |this, _, link: &Followed, window, cx| {
             this.follow(&link.0, window, cx);
         })
@@ -91,6 +104,7 @@ impl Wevren {
             autosave: None,
             dirty: false,
             rename_editor: None,
+            find: None,
         };
         this.reload();
         this
@@ -141,6 +155,7 @@ impl Wevren {
         }
         self.open = None;
         self.rename_editor = None;
+        self.find = None;
         self.settings.folder = Some(folder);
         self.report(self.settings.save());
         self.settings_open |= self.error.is_some();
@@ -160,6 +175,7 @@ impl Wevren {
             self.editor.focus_handle(cx).focus(window);
             self.open = Some(path);
             self.rename_editor = None;
+            self.find = None;
             self.settings_open = false;
         }
         cx.notify();
@@ -195,6 +211,9 @@ impl Wevren {
     }
 
     fn begin_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.is_some() {
+            self.close_find(window, cx);
+        }
         let Some(path) = &self.open else {
             return;
         };
@@ -215,6 +234,95 @@ impl Wevren {
             input.focus_handle(cx).focus(window);
         }
         self.settings_open = false;
+        cx.notify();
+    }
+
+    fn begin_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.open.is_none() || self.rename_editor.is_some() {
+            return;
+        }
+        self.settings_open = false;
+        if self.find.is_none() {
+            let selected = self.editor.read(cx).selected_text();
+            let query = if selected.contains('\n') {
+                String::new()
+            } else {
+                selected.to_owned()
+            };
+            let input = cx.new(|cx| Editor::single_line(query, cx));
+            cx.subscribe(&input, |this, _, _: &Edited, cx| {
+                this.refresh_find(true, cx);
+            })
+            .detach();
+            cx.subscribe_in(&input, window, |this, _, event: &Submitted, _, cx| {
+                this.step_find(event.0, cx);
+            })
+            .detach();
+            cx.subscribe_in(&input, window, |this, _, _: &Cancelled, window, cx| {
+                this.close_find(window, cx);
+            })
+            .detach();
+            self.find = Some(Find {
+                input,
+                matches: Vec::new(),
+                current: None,
+            });
+            self.refresh_find(true, cx);
+        }
+        if let Some(find) = &self.find {
+            find.input.focus_handle(cx).focus(window);
+        }
+        cx.notify();
+    }
+
+    fn refresh_find(&mut self, select: bool, cx: &mut Context<Self>) {
+        let Some(find) = &mut self.find else {
+            return;
+        };
+        let editor = self.editor.read(cx);
+        find.matches = search::matches(editor.text(), find.input.read(cx).text());
+        find.current = (!find.matches.is_empty()).then(|| {
+            find.matches
+                .iter()
+                .position(|range| range.start >= editor.selection_start())
+                .unwrap_or(0)
+        });
+        let matches = find.matches.clone();
+        let current = find.current;
+        self.editor.update(cx, |editor, cx| {
+            editor.set_matches(matches, current, select, cx);
+        });
+        cx.notify();
+    }
+
+    fn step_find(&mut self, previous: bool, cx: &mut Context<Self>) {
+        let Some(find) = &mut self.find else {
+            return;
+        };
+        let count = find.matches.len();
+        if count == 0 {
+            return;
+        }
+        let current = find.current.unwrap_or(0);
+        find.current = Some(if previous {
+            (current + count - 1) % count
+        } else {
+            (current + 1) % count
+        });
+        let matches = find.matches.clone();
+        let current = find.current;
+        self.editor.update(cx, |editor, cx| {
+            editor.set_matches(matches, current, true, cx);
+        });
+        cx.notify();
+    }
+
+    fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.find = None;
+        self.editor.update(cx, |editor, cx| {
+            editor.set_matches(Vec::new(), None, false, cx);
+        });
+        self.editor.focus_handle(cx).focus(window);
         cx.notify();
     }
 
@@ -279,6 +387,17 @@ impl Wevren {
 
     /// Handles the platform's shortcuts for saving and for a new note.
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.find.is_some() {
+            match event.keystroke.key.as_str() {
+                "escape" => self.close_find(window, cx),
+                "f3" => self.step_find(event.keystroke.modifiers.shift, cx),
+                _ => {}
+            }
+            if matches!(event.keystroke.key.as_str(), "escape" | "f3") {
+                cx.stop_propagation();
+                return;
+            }
+        }
         if event.keystroke.key == "f2" {
             self.begin_rename(window, cx);
             cx.stop_propagation();
@@ -289,6 +408,7 @@ impl Wevren {
             return;
         }
         match event.keystroke.key.as_str() {
+            "f" => self.begin_find(window, cx),
             "s" => {
                 self.save(cx);
             }
@@ -428,13 +548,87 @@ impl Wevren {
             .child(title)
             .child(rule(theme))
             .child(self.editor.clone());
-        sheet(theme)
+        let scroll = div()
             .id("note")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .w_full()
             .items_center()
             .overflow_y_scroll()
             .track_scroll(self.editor.read(cx).scroll_handle())
-            .child(column)
+            .child(column);
+        sheet(theme)
+            .when(self.find.is_some(), |sheet| {
+                sheet.child(self.find_bar(theme, cx))
+            })
+            .child(scroll)
             .into_any_element()
+    }
+
+    fn find_bar(&self, theme: Theme, cx: &mut Context<Self>) -> Div {
+        let Some(find) = &self.find else {
+            return div();
+        };
+        let count = find.matches.len();
+        let status = if find.input.read(cx).text().is_empty() {
+            "Find in note".to_owned()
+        } else if count == 0 {
+            "No matches".to_owned()
+        } else {
+            format!("{} / {count}", find.current.map_or(0, |index| index + 1))
+        };
+        let buttons = [
+            ("find-previous", "Previous", Some(true)),
+            ("find-next", "Next", Some(false)),
+            ("find-close", "Close", None),
+        ]
+        .into_iter()
+        .map(|(id, label, previous)| {
+            div()
+                .id(id)
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.hover).text_color(theme.text))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if let Some(previous) = previous {
+                        this.step_find(previous, cx);
+                    } else {
+                        this.close_find(window, cx);
+                    }
+                }))
+                .child(label)
+        });
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .px_4()
+            .py_2()
+            .border_b_1()
+            .border_color(theme.line)
+            .font_family(theme.ui_font)
+            .text_size(px(12.))
+            .text_color(theme.muted)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .px_2()
+                    .py_1()
+                    .bg(theme.ground)
+                    .border_1()
+                    .border_color(theme.line)
+                    .rounded_md()
+                    .text_color(theme.text)
+                    .child(find.input.clone()),
+            )
+            .child(div().flex_none().child(status))
+            .children(buttons)
     }
 
     /// Returns the settings page, which doubles as the welcome page.

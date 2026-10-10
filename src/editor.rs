@@ -67,7 +67,7 @@ pub struct Edited;
 pub struct Followed(pub String);
 
 #[derive(Clone, Copy, Debug)]
-pub struct Submitted;
+pub struct Submitted(pub bool);
 
 #[derive(Clone, Copy, Debug)]
 pub struct Cancelled;
@@ -92,6 +92,8 @@ struct Row {
 pub struct Editor {
     text: SharedString,
     history: History,
+    matches: Vec<Range<usize>>,
+    active_match: Option<usize>,
     single_line: bool,
     /// Selected bytes, empty when there is only a caret.
     selection: Range<usize>,
@@ -133,6 +135,8 @@ impl Editor {
         Self {
             text: SharedString::default(),
             history: History::default(),
+            matches: Vec::new(),
+            active_match: None,
             single_line: false,
             selection: 0..0,
             reversed: false,
@@ -172,10 +176,37 @@ impl Editor {
     pub fn set_text(&mut self, text: String, cx: &mut Context<Self>) {
         self.text = text.into();
         self.history = History::default();
+        self.matches.clear();
+        self.active_match = None;
         self.selection = 0..0;
         self.reversed = false;
         self.marked = None;
         self.scroll.set_offset(Point::default());
+        cx.notify();
+    }
+
+    pub fn selected_text(&self) -> &str {
+        &self.text[self.selection.clone()]
+    }
+
+    pub fn selection_start(&self) -> usize {
+        self.selection.start
+    }
+
+    pub fn set_matches(
+        &mut self,
+        matches: Vec<Range<usize>>,
+        active: Option<usize>,
+        select: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.matches = matches;
+        self.active_match = active;
+        if select && let Some(range) = active.and_then(|index| self.matches.get(index)) {
+            self.selection = range.clone();
+            self.reversed = false;
+            self.reveal = true;
+        }
         cx.notify();
     }
 
@@ -338,8 +369,8 @@ impl Editor {
     }
 
     /// Returns the rectangles covering the selection in an editor of `width`.
-    fn selection_quads(&self, width: Pixels, color: Rgba) -> Vec<PaintQuad> {
-        let Range { start, end } = self.selection;
+    fn range_quads(&self, range: Range<usize>, width: Pixels, color: Rgba) -> Vec<PaintQuad> {
+        let Range { start, end } = range;
         let quad = |from: Point<Pixels>, to: Point<Pixels>| {
             fill(
                 Bounds::from_corners(self.origin + from, self.origin + to),
@@ -412,7 +443,7 @@ impl Editor {
         // AltGr reports as control and alt together, and must keep typing characters.
         let command = modifiers.secondary() && !modifiers.alt;
         match key.as_str() {
-            "enter" if self.single_line => cx.emit(Submitted),
+            "enter" if self.single_line => cx.emit(Submitted(modifiers.shift)),
             "escape" if self.single_line => cx.emit(Cancelled),
             "z" if command => self.restore_history(modifiers.shift, cx),
             "y" if command => self.restore_history(true, cx),
@@ -946,7 +977,25 @@ impl Element for EditorElement {
             a: SELECTION_ALPHA,
             ..accent
         };
-        let mut quads = editor.selection_quads(bounds.size.width, selection);
+        let mut quads = Vec::new();
+        for (index, range) in editor.matches.iter().enumerate() {
+            let highlight = Rgba {
+                a: if Some(index) == editor.active_match {
+                    0.4
+                } else {
+                    0.15
+                },
+                ..accent
+            };
+            quads.extend(editor.range_quads(range.clone(), bounds.size.width, highlight));
+        }
+        if focus.is_focused(window) || editor.active_match.is_none() {
+            quads.extend(editor.range_quads(
+                editor.selection.clone(),
+                bounds.size.width,
+                selection,
+            ));
+        }
         if editor.selection.is_empty() && focus.is_focused(window) {
             let caret = Bounds::new(
                 origin + editor.position(editor.caret()),
