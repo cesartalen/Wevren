@@ -220,6 +220,20 @@ impl Editor {
         self.scroll.set_offset(scroll);
     }
 
+    pub fn select_range(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
+        if range.start <= range.end
+            && range.end <= self.text.len()
+            && self.text.is_char_boundary(range.start)
+            && self.text.is_char_boundary(range.end)
+        {
+            self.selection = range;
+            self.reversed = false;
+            self.completion = None;
+            self.reveal = true;
+            cx.notify();
+        }
+    }
+
     fn refresh_completion(&mut self) {
         if self.single_line || !self.selection.is_empty() || self.marked.is_some() {
             self.completion = None;

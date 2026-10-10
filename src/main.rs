@@ -11,6 +11,7 @@ mod search;
 mod settings;
 mod theme;
 mod window_controls;
+mod workspace_search;
 
 use std::{
     cmp::Reverse,
@@ -68,6 +69,10 @@ struct Switcher {
     input: Entity<Editor>,
     results: Vec<PathBuf>,
     selected: usize,
+    content: bool,
+    hits: workspace_search::Results,
+    busy: bool,
+    scroll: gpui::ScrollHandle,
 }
 
 #[derive(Debug)]
@@ -111,6 +116,7 @@ struct Wevren {
     navigation: Vec<PathBuf>,
     navigation_index: Option<usize>,
     tabs: Vec<Tab>,
+    content_search: Option<Task<anyhow::Result<()>>>,
 }
 
 impl Wevren {
@@ -145,6 +151,7 @@ impl Wevren {
             navigation: Vec::new(),
             navigation_index: None,
             tabs: Vec::new(),
+            content_search: None,
         };
         this.reload(cx);
         this.focus.focus(window);
@@ -279,6 +286,15 @@ impl Wevren {
     }
 
     fn begin_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.begin_workspace_search(false, window, cx);
+    }
+
+    fn begin_workspace_search(
+        &mut self,
+        content: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.settings.folder.is_none() {
             return;
         }
@@ -297,20 +313,15 @@ impl Wevren {
                         } else {
                             (switcher.selected + 1) % count
                         };
+                        switcher.scroll.scroll_to_item(switcher.selected);
                     }
                 }
                 cx.notify();
             })
             .detach();
             cx.subscribe_in(&input, window, |this, _, _: &Submitted, window, cx| {
-                let path = this
-                    .switcher
-                    .as_ref()
-                    .and_then(|switcher| switcher.results.get(switcher.selected))
-                    .cloned();
-                if let Some(path) = path {
-                    this.close_switcher(window, cx);
-                    this.open_note(path, window, cx);
+                if let Some(switcher) = &this.switcher {
+                    this.open_search_result(switcher.selected, window, cx);
                 }
             })
             .detach();
@@ -322,6 +333,10 @@ impl Wevren {
                 input,
                 results: Vec::new(),
                 selected: 0,
+                content,
+                hits: workspace_search::Results::default(),
+                busy: false,
+                scroll: gpui::ScrollHandle::new(),
             });
             self.refresh_switcher(cx);
         }
@@ -332,6 +347,14 @@ impl Wevren {
     }
 
     fn refresh_switcher(&mut self, cx: &mut Context<Self>) {
+        if self
+            .switcher
+            .as_ref()
+            .is_some_and(|switcher| switcher.content)
+        {
+            self.refresh_content_search(cx);
+            return;
+        }
         let (Some(switcher), Some(root)) = (&mut self.switcher, &self.settings.folder) else {
             return;
         };
@@ -358,7 +381,74 @@ impl Wevren {
         cx.notify();
     }
 
+    fn refresh_content_search(&mut self, cx: &mut Context<Self>) {
+        self.content_search.take();
+        let Some(switcher) = &mut self.switcher else {
+            return;
+        };
+        let input = switcher.input.clone();
+        let query = input.read(cx).text().to_owned();
+        switcher.results.clear();
+        switcher.hits = workspace_search::Results::default();
+        switcher.selected = 0;
+        switcher.busy = !query.is_empty();
+        switcher.scroll.set_offset(gpui::Point::default());
+        if query.is_empty() {
+            cx.notify();
+            return;
+        }
+        let paths = self.notes.clone();
+        let open = self
+            .open
+            .clone()
+            .map(|path| (path, self.editor.read(cx).text().to_owned()));
+        self.content_search = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(150))
+                .await;
+            let search_query = query.clone();
+            let hits = cx
+                .background_executor()
+                .spawn(async move { workspace_search::find(&paths, &search_query, open.as_ref()) })
+                .await;
+            this.update(cx, |this, cx| {
+                if let Some(switcher) = &mut this.switcher
+                    && switcher.input == input
+                    && switcher.input.read(cx).text() == query
+                {
+                    switcher.results = hits.hits.iter().map(|hit| hit.path.clone()).collect();
+                    switcher.hits = hits;
+                    switcher.busy = false;
+                    cx.notify();
+                }
+            })
+        }));
+        cx.notify();
+    }
+
+    fn open_search_result(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(switcher) = &self.switcher else {
+            return;
+        };
+        let Some(path) = switcher.results.get(index).cloned() else {
+            return;
+        };
+        let hit = switcher.hits.hits.get(index).cloned();
+        let query = switcher.input.read(cx).text().to_owned();
+        self.close_switcher(window, cx);
+        if self.open_note_with_history(path, true, window, cx)
+            && let Some(hit) = hit
+            && let Some(range) = search::matches(self.editor.read(cx).text(), &query)
+                .into_iter()
+                .min_by_key(|range| range.start.abs_diff(hit.range.start))
+        {
+            self.editor
+                .update(cx, |editor, cx| editor.select_range(range, cx));
+        }
+    }
+
     fn close_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.content_search.take();
         self.switcher = None;
         if self.open.is_some() && !self.settings_open {
             self.editor.focus_handle(cx).focus(window);
@@ -368,86 +458,141 @@ impl Wevren {
         cx.notify();
     }
 
-    fn switcher_page(&self, theme: Theme, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
-        let switcher = self.switcher.as_ref()?;
-        let rows = switcher.results.iter().enumerate().map(|(index, path)| {
-            let path = path.clone();
-            let location = self
-                .settings
-                .folder
-                .as_ref()
-                .map_or_else(String::new, |root| notes::link_title(&path, root));
-            div()
-                .id(index)
-                .flex()
-                .flex_col()
-                .gap_1()
-                .px_4()
-                .py_2()
-                .cursor_pointer()
-                .when(index == switcher.selected, |row| row.bg(theme.hover))
-                .hover(|row| row.bg(theme.hover))
-                .child(div().text_color(theme.text).child(notes::title(&path)))
-                .child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(theme.muted)
-                        .truncate()
-                        .child(location),
-                )
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.close_switcher(window, cx);
-                    this.open_note(path.clone(), window, cx);
-                    cx.stop_propagation();
-                }))
-        });
-        let panel = div()
-            .id("switcher-panel")
-            .flex()
-            .flex_col()
-            .w(px(520.))
-            .max_w_full()
-            .bg(theme.sheet)
-            .border_1()
-            .border_color(theme.line)
-            .rounded_lg()
-            .shadow_lg()
-            .overflow_hidden()
-            .font_family(theme.ui_font)
-            .text_size(px(14.))
-            .on_click(|_, _, cx| cx.stop_propagation())
-            .child(label("OPEN NOTE", theme).px_4().pt_3().pb_2())
-            .child(
+    fn switcher_rows(
+        &self,
+        switcher: &Switcher,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<Stateful<Div>> {
+        switcher
+            .results
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let path = path.clone();
+                let mut location = self
+                    .settings
+                    .folder
+                    .as_ref()
+                    .map_or_else(String::new, |root| notes::link_title(&path, root));
+                let hit = switcher.hits.hits.get(index);
+                if let Some(hit) = hit {
+                    location = format!("{location}:{}", hit.line);
+                }
                 div()
-                    .mx_3()
-                    .mb_2()
-                    .px_3()
-                    .py_2()
-                    .border_1()
-                    .border_color(theme.accent)
-                    .rounded_md()
-                    .child(switcher.input.clone()),
-            )
-            .when(switcher.results.is_empty(), |panel| {
-                panel.child(
-                    div()
-                        .px_4()
-                        .py_3()
-                        .text_color(theme.muted)
-                        .child("No matching notes"),
-                )
-            })
-            .children(rows)
-            .child(
-                div()
+                    .id(index)
+                    .flex()
+                    .flex_col()
+                    .gap_1()
                     .px_4()
                     .py_2()
-                    .border_t_1()
-                    .border_color(theme.line)
-                    .text_color(theme.muted)
-                    .text_size(px(11.))
-                    .child("Up/Down to choose · Enter to open · Escape to close"),
-            );
+                    .cursor_pointer()
+                    .when(index == switcher.selected, |row| row.bg(theme.hover))
+                    .hover(|row| row.bg(theme.hover))
+                    .child(div().text_color(theme.text).child(notes::title(&path)))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.muted)
+                            .truncate()
+                            .child(location),
+                    )
+                    .children(hit.map(|hit| {
+                        div()
+                            .truncate()
+                            .text_color(theme.muted)
+                            .child(hit.snippet.clone())
+                    }))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_search_result(index, window, cx);
+                        cx.stop_propagation();
+                    }))
+            })
+            .collect()
+    }
+
+    fn switcher_page(&self, theme: Theme, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let switcher = self.switcher.as_ref()?;
+        let rows = self.switcher_rows(switcher, theme, cx);
+        let panel =
+            div()
+                .id("switcher-panel")
+                .flex()
+                .flex_col()
+                .w(px(520.))
+                .max_w_full()
+                .bg(theme.sheet)
+                .border_1()
+                .border_color(theme.line)
+                .rounded_lg()
+                .shadow_lg()
+                .overflow_hidden()
+                .font_family(theme.ui_font)
+                .text_size(px(14.))
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .child(
+                    label(
+                        if switcher.content {
+                            "SEARCH WORKSPACE"
+                        } else {
+                            "OPEN NOTE"
+                        },
+                        theme,
+                    )
+                    .px_4()
+                    .pt_3()
+                    .pb_2(),
+                )
+                .child(
+                    div()
+                        .mx_3()
+                        .mb_2()
+                        .px_3()
+                        .py_2()
+                        .border_1()
+                        .border_color(theme.accent)
+                        .rounded_md()
+                        .child(switcher.input.clone()),
+                )
+                .when(switcher.results.is_empty(), |panel| {
+                    panel.child(div().px_4().py_3().text_color(theme.muted).child(
+                        if switcher.busy {
+                            "Searching..."
+                        } else if switcher.content && switcher.input.read(cx).text().is_empty() {
+                            "Type to search note contents"
+                        } else {
+                            "No matching notes"
+                        },
+                    ))
+                })
+                .child(
+                    div()
+                        .id("search-results")
+                        .max_h(px(340.))
+                        .overflow_y_scroll()
+                        .track_scroll(&switcher.scroll)
+                        .children(rows),
+                )
+                .when(switcher.content, |panel| {
+                    panel.child(
+                        div()
+                            .px_4()
+                            .py_1()
+                            .text_color(theme.muted)
+                            .text_size(px(11.))
+                            .child(switcher.hits.summary()),
+                    )
+                })
+                .child(
+                    div()
+                        .px_4()
+                        .py_2()
+                        .border_t_1()
+                        .border_color(theme.line)
+                        .text_color(theme.muted)
+                        .text_size(px(11.))
+                        .child("Up/Down to choose · Enter to open · Escape to close"),
+                );
         Some(
             div()
                 .id("switcher-overlay")
@@ -1246,6 +1391,7 @@ impl Wevren {
         }
         match event.keystroke.key.as_str() {
             "p" => self.begin_switcher(window, cx),
+            "f" if modifiers.shift => self.begin_workspace_search(true, window, cx),
             "f" => self.begin_find(window, cx),
             "s" => {
                 self.save(cx);
@@ -1359,6 +1505,19 @@ impl Wevren {
                     .flex()
                     .items_center()
                     .gap_2()
+                    .child(
+                        div()
+                            .id("workspace-search")
+                            .cursor_pointer()
+                            .font_family(ICON_FONT)
+                            .text_size(px(12.))
+                            .text_color(theme.muted)
+                            .hover(|button| button.text_color(theme.text))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.begin_workspace_search(true, window, cx);
+                            }))
+                            .child("\u{e721}"),
+                    )
                     .child(
                         div()
                             .id("new-folder")
