@@ -284,6 +284,12 @@ impl Editor {
         // AltGr reports as control and alt together, and must keep typing characters.
         let command = modifiers.secondary() && !modifiers.alt;
         match key.as_str() {
+            "left" if command => self.move_to(previous_word(&self.text, caret), select, cx),
+            "right" if command => self.move_to(next_word(&self.text, caret), select, cx),
+            "home" if command => self.move_to(0, select, cx),
+            "end" if command => self.move_to(self.text.len(), select, cx),
+            "backspace" if command => self.delete(previous_word(&self.text, caret)..caret, cx),
+            "delete" if command => self.delete(caret..next_word(&self.text, caret), cx),
             "left" if step => self.move_to(self.previous(caret), select, cx),
             "left" => self.move_to(self.selection.start, false, cx),
             "right" if step => self.move_to(self.next(caret), select, cx),
@@ -370,6 +376,46 @@ fn from_utf16(text: &str, offset: usize) -> usize {
 /// Returns the UTF-16 offset of the byte `offset` in `text`.
 fn to_utf16(text: &str, offset: usize) -> usize {
     text[..offset].encode_utf16().count()
+}
+
+/// The kinds of character that word movement tells apart.
+#[derive(Debug, PartialEq, Eq)]
+enum Kind {
+    Space,
+    Word,
+    Symbol,
+}
+
+/// Returns the kind of `character`.
+fn kind(character: char) -> Kind {
+    match character {
+        _ if character.is_whitespace() => Kind::Space,
+        _ if character.is_alphanumeric() || character == '_' => Kind::Word,
+        _ => Kind::Symbol,
+    }
+}
+
+/// Returns the start of the word or run of symbols before `offset` in `text`.
+fn previous_word(text: &str, offset: usize) -> usize {
+    let before = text[..offset].trim_end();
+    let Some(last) = before.chars().next_back() else {
+        return 0;
+    };
+    let other = before.rfind(|character| kind(character) != kind(last));
+    other.map_or(0, |index| {
+        index + before[index..].chars().next().map_or(0, char::len_utf8)
+    })
+}
+
+/// Returns the start of the word or run of symbols after `offset` in `text`.
+fn next_word(text: &str, offset: usize) -> usize {
+    let after = &text[offset..];
+    let Some(first) = after.chars().next() else {
+        return offset;
+    };
+    let run = after.find(|character| kind(character) != kind(first));
+    let rest = run.map_or("", |run| &after[run..]);
+    text.len() - rest.trim_start().len()
 }
 
 impl EntityInputHandler for Editor {
