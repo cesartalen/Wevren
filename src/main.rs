@@ -2,6 +2,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod completion;
 mod editor;
 mod markdown;
 mod notes;
@@ -106,7 +107,7 @@ impl Wevren {
             rename_editor: None,
             find: None,
         };
-        this.reload();
+        this.reload(cx);
         this
     }
 
@@ -122,9 +123,13 @@ impl Wevren {
     }
 
     /// Reads the list of notes from the notes folder.
-    fn reload(&mut self) {
+    fn reload(&mut self, cx: &mut App) {
         let notes = self.settings.folder.as_deref().map(notes::list).transpose();
         self.notes = self.report(notes).flatten().unwrap_or_default();
+        let titles = self.notes.iter().map(|path| notes::title(path)).collect();
+        self.editor.update(cx, |editor, cx| {
+            editor.set_note_titles(titles, cx);
+        });
     }
 
     /// Asks for a folder and keeps the notes in it from then on.
@@ -148,7 +153,7 @@ impl Wevren {
     }
 
     /// Stores `folder` as the notes folder, keeping the settings open on failure.
-    fn set_folder(&mut self, folder: PathBuf, cx: &App) {
+    fn set_folder(&mut self, folder: PathBuf, cx: &mut App) {
         self.error = None;
         if !self.save(cx) {
             return;
@@ -159,7 +164,7 @@ impl Wevren {
         self.settings.folder = Some(folder);
         self.report(self.settings.save());
         self.settings_open |= self.error.is_some();
-        self.reload();
+        self.reload(cx);
     }
 
     /// Shows the note at `path` in the editor.
@@ -343,7 +348,7 @@ impl Wevren {
             && let Some(renamed) = self.report(notes::rename(&path, &title))
         {
             self.open = Some(renamed);
-            self.reload();
+            self.reload(cx);
             self.cancel_rename(window, cx);
         }
         cx.notify();
@@ -379,7 +384,7 @@ impl Wevren {
         cx: &mut Context<Self>,
     ) {
         if let Some(path) = self.report(path) {
-            self.reload();
+            self.reload(cx);
             self.open_note(path, window, cx);
         }
         cx.notify();

@@ -12,7 +12,11 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 
-use crate::{markdown, theme::Theme};
+use crate::{
+    completion::{self, Completion},
+    markdown,
+    theme::Theme,
+};
 
 /// Width of the caret, thin yet visible on dense displays.
 const CARET_WIDTH: Pixels = px(1.5);
@@ -94,6 +98,8 @@ pub struct Editor {
     history: History,
     matches: Vec<Range<usize>>,
     active_match: Option<usize>,
+    note_titles: Vec<String>,
+    completion: Option<Completion>,
     single_line: bool,
     /// Selected bytes, empty when there is only a caret.
     selection: Range<usize>,
@@ -137,6 +143,8 @@ impl Editor {
             history: History::default(),
             matches: Vec::new(),
             active_match: None,
+            note_titles: Vec::new(),
+            completion: None,
             single_line: false,
             selection: 0..0,
             reversed: false,
@@ -178,11 +186,133 @@ impl Editor {
         self.history = History::default();
         self.matches.clear();
         self.active_match = None;
+        self.completion = None;
         self.selection = 0..0;
         self.reversed = false;
         self.marked = None;
         self.scroll.set_offset(Point::default());
         cx.notify();
+    }
+
+    pub fn set_note_titles(&mut self, titles: Vec<String>, cx: &mut Context<Self>) {
+        self.note_titles = titles;
+        self.refresh_completion();
+        cx.notify();
+    }
+
+    fn refresh_completion(&mut self) {
+        if self.single_line || !self.selection.is_empty() || self.marked.is_some() {
+            self.completion = None;
+            return;
+        }
+        let selected = self
+            .completion
+            .as_ref()
+            .and_then(|completion| completion.items.get(completion.selected).cloned());
+        self.completion = completion::link(&self.text, self.caret(), &self.note_titles);
+        if let Some(completion) = &mut self.completion
+            && let Some(selected) = selected
+            && let Some(index) = completion.items.iter().position(|title| *title == selected)
+        {
+            completion.selected = index;
+        }
+    }
+
+    fn accept_completion(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(completion) = self.completion.take() else {
+            return;
+        };
+        let Some(title) = completion.items.get(index) else {
+            return;
+        };
+        let text = if completion.close {
+            format!("{title}]]")
+        } else {
+            title.clone()
+        };
+        if self.text[completion.range.clone()] == text {
+            self.move_to(completion.range.end, false, cx);
+        } else {
+            self.replace(completion.range, &text, cx);
+        }
+        self.completion = None;
+    }
+
+    fn completion_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        let Some(completion) = &mut self.completion else {
+            return false;
+        };
+        match key {
+            "up" => {
+                completion.selected =
+                    (completion.selected + completion.items.len() - 1) % completion.items.len();
+            }
+            "down" => completion.selected = (completion.selected + 1) % completion.items.len(),
+            "enter" | "tab" => {
+                let selected = completion.selected;
+                self.accept_completion(selected, cx);
+            }
+            "escape" => self.completion = None,
+            _ => return false,
+        }
+        cx.notify();
+        true
+    }
+
+    fn completion_menu(&self, cx: &mut Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {
+        let completion = self.completion.as_ref()?;
+        let theme = *cx.global::<Theme>();
+        let caret = self.position(self.caret());
+        let height = completion
+            .items
+            .iter()
+            .fold(Pixels::ZERO, |height, _| height + px(32.));
+        let below = caret.y + self.height_at(self.caret());
+        let top = if self.origin.y + below + height > self.scroll.bounds().bottom() {
+            (caret.y - height).max(Pixels::ZERO)
+        } else {
+            below
+        };
+        let items = completion.items.iter().enumerate().map(|(index, title)| {
+            div()
+                .id(index)
+                .flex()
+                .items_center()
+                .h(px(32.))
+                .px_3()
+                .truncate()
+                .cursor_pointer()
+                .when(index == completion.selected, |item| {
+                    item.bg(theme.hover).text_color(theme.text)
+                })
+                .hover(|item| item.bg(theme.hover).text_color(theme.text))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.accept_completion(index, cx);
+                    this.focus.focus(window);
+                }))
+                .child(title.clone())
+        });
+        Some(
+            div()
+                .id("link-completion")
+                .absolute()
+                .left_0()
+                .top(top)
+                .w_full()
+                .max_w(px(320.))
+                .bg(theme.sheet)
+                .border_1()
+                .border_color(theme.line)
+                .rounded_md()
+                .shadow_md()
+                .overflow_hidden()
+                .font_family(theme.ui_font)
+                .text_size(px(14.))
+                .text_color(theme.muted)
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .children(items),
+        )
     }
 
     pub fn selected_text(&self) -> &str {
@@ -206,6 +336,7 @@ impl Editor {
             self.selection = range.clone();
             self.reversed = false;
             self.reveal = true;
+            self.completion = None;
         }
         cx.notify();
     }
@@ -228,6 +359,7 @@ impl Editor {
         };
         self.selection = anchor.min(offset)..anchor.max(offset);
         self.reversed = offset < anchor;
+        self.refresh_completion();
         self.reveal = true;
         cx.notify();
     }
@@ -255,6 +387,8 @@ impl Editor {
         self.reversed = false;
         self.marked = None;
         self.reveal = true;
+        self.completion = None;
+        self.refresh_completion();
         cx.emit(Edited);
         cx.notify();
     }
@@ -282,6 +416,7 @@ impl Editor {
             self.selecting = false;
             self.over_link = false;
             self.reveal = true;
+            self.refresh_completion();
             cx.emit(Edited);
             cx.notify();
         }
@@ -412,10 +547,32 @@ impl Editor {
     }
 
     /// Stores the laid out `lines` and scrolls the caret into view when asked to.
-    fn layout(&mut self, rows: Vec<Row>, origin: Point<Pixels>, window: &Window) {
+    fn layout(
+        &mut self,
+        rows: Vec<Row>,
+        origin: Point<Pixels>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous = (
+            self.position(self.caret()),
+            self.height_at(self.caret()),
+            self.origin,
+        );
         self.origin = origin;
         self.line_height = window.line_height();
         self.rows = rows;
+        if self.completion.is_some()
+            && previous
+                != (
+                    self.position(self.caret()),
+                    self.height_at(self.caret()),
+                    self.origin,
+                )
+        {
+            cx.notify();
+            window.request_animation_frame();
+        }
         if !mem::take(&mut self.reveal) {
             return;
         }
@@ -442,6 +599,10 @@ impl Editor {
         let step = select || self.selection.is_empty();
         // AltGr reports as control and alt together, and must keep typing characters.
         let command = modifiers.secondary() && !modifiers.alt;
+        if !command && !modifiers.alt && self.completion_key(key, cx) {
+            cx.stop_propagation();
+            return;
+        }
         match key.as_str() {
             "enter" if self.single_line => cx.emit(Submitted(modifiers.shift)),
             "escape" if self.single_line => cx.emit(Cancelled),
@@ -473,6 +634,7 @@ impl Editor {
             "a" if command => {
                 self.selection = 0..self.text.len();
                 self.reversed = false;
+                self.completion = None;
                 cx.notify();
             }
             "c" | "x" if command => {
@@ -670,8 +832,10 @@ impl EntityInputHandler for Editor {
         self.marked.as_ref().map(|range| self.range_to_utf16(range))
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.marked = None;
+        self.refresh_completion();
+        cx.notify();
     }
 
     fn replace_text_in_range(
@@ -683,6 +847,7 @@ impl EntityInputHandler for Editor {
     ) {
         self.replace(self.input_range(range.as_ref()), text, cx);
         self.marked = None;
+        self.refresh_completion();
     }
 
     fn replace_and_mark_text_in_range(
@@ -703,6 +868,7 @@ impl EntityInputHandler for Editor {
             self.selection = start + from_utf16(new_text, selected.start)
                 ..start + from_utf16(new_text, selected.end);
         }
+        self.refresh_completion();
     }
 
     fn bounds_for_range(
@@ -732,8 +898,14 @@ impl EntityInputHandler for Editor {
 }
 
 impl Render for Editor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let menu = if self.focus.is_focused(window) {
+            self.completion_menu(cx)
+        } else {
+            None
+        };
         div()
+            .relative()
             .flex_grow()
             .track_focus(&self.focus)
             .map(|editor| {
@@ -748,6 +920,7 @@ impl Render for Editor {
             .on_mouse_move(cx.listener(Self::mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .child(EditorElement(cx.entity()))
+            .children(menu)
     }
 }
 
@@ -944,7 +1117,7 @@ impl Element for EditorElement {
         cx: &mut App,
     ) {
         let accent = cx.global::<Theme>().accent;
-        self.0.update(cx, |editor, _cx| {
+        self.0.update(cx, |editor, cx| {
             let width = Some(bounds.size.width);
             let style = window.text_style();
             let spans = editor.spans(&style, accent);
@@ -956,7 +1129,7 @@ impl Element for EditorElement {
                 !editor.single_line,
                 window,
             );
-            editor.layout(lines, bounds.origin, window);
+            editor.layout(lines, bounds.origin, window, cx);
         });
     }
 
