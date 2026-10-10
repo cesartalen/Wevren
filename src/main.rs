@@ -10,6 +10,7 @@ mod notes;
 mod search;
 mod settings;
 mod theme;
+mod window_controls;
 
 use std::{
     cmp::Reverse,
@@ -147,20 +148,20 @@ impl Wevren {
         this.start_watcher(cx);
         let view = cx.entity().downgrade();
         window.on_window_should_close(cx, move |_, cx| {
-            view.update(cx, |this, cx| {
-                let saved = this.save(cx);
-                if !saved {
-                    this.settings_open = false;
-                    this.error.get_or_insert_with(|| {
-                        "Resolve unsaved changes before closing Wevren.".into()
-                    });
-                    cx.notify();
-                }
-                saved
-            })
-            .unwrap_or(true)
+            view.update(cx, Self::prepare_close).unwrap_or(true)
         });
         this
+    }
+
+    fn prepare_close(&mut self, cx: &mut Context<Self>) -> bool {
+        let saved = self.save(cx);
+        if !saved {
+            self.settings_open = false;
+            self.error
+                .get_or_insert_with(|| "Resolve unsaved changes before closing Wevren.".into());
+            cx.notify();
+        }
+        saved
     }
 
     fn start_watcher(&mut self, cx: &mut Context<Self>) {
@@ -1415,8 +1416,6 @@ fn icon_button(glyph: &'static str, size: f32, hover: Rgba, theme: Theme) -> Sta
 /// Returns the custom titlebar: a draggable wordmark and the window buttons.
 fn titlebar(theme: Theme, cx: &mut Context<Wevren>) -> impl IntoElement {
     let [min, max, close] = CAPTION_GLYPHS;
-    let caption_button =
-        |glyph, area, hover| icon_button(glyph, 10., hover, theme).window_control_area(area);
     div()
         .flex()
         .flex_none()
@@ -1459,13 +1458,33 @@ fn titlebar(theme: Theme, cx: &mut Context<Wevren>) -> impl IntoElement {
                         .when(theme.dark, |d| d.bg(theme.muted)),
                 ),
         )
-        .child(caption_button(min, WindowControlArea::Min, theme.hover))
-        .child(caption_button(max, WindowControlArea::Max, theme.hover))
-        .child(caption_button(
-            close,
-            WindowControlArea::Close,
-            theme.danger,
-        ))
+        .child(
+            icon_button(min, 10., theme.hover, theme)
+                .cursor_pointer()
+                .on_click(cx.listener(|_, _, window, cx| {
+                    cx.stop_propagation();
+                    window.minimize_window();
+                })),
+        )
+        .child(
+            icon_button(max, 10., theme.hover, theme)
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.report(window_controls::toggle_maximize(window));
+                    cx.notify();
+                })),
+        )
+        .child(
+            icon_button(close, 10., theme.danger, theme)
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, window, cx| {
+                    cx.stop_propagation();
+                    if this.prepare_close(cx) {
+                        window.remove_window();
+                    }
+                })),
+        )
 }
 
 /// Returns a small heading for a group of controls.
