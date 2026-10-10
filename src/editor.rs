@@ -76,6 +76,9 @@ pub struct Submitted(pub bool);
 #[derive(Clone, Copy, Debug)]
 pub struct Cancelled;
 
+#[derive(Clone, Copy, Debug)]
+pub struct Navigated(pub bool);
+
 /// A hard line of text laid out at the current width.
 #[derive(Clone, Debug)]
 struct Row {
@@ -128,6 +131,8 @@ impl EventEmitter<Followed> for Editor {}
 impl EventEmitter<Submitted> for Editor {}
 
 impl EventEmitter<Cancelled> for Editor {}
+
+impl EventEmitter<Navigated> for Editor {}
 
 impl Focusable for Editor {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -604,6 +609,8 @@ impl Editor {
             return;
         }
         match key.as_str() {
+            "up" if self.single_line => cx.emit(Navigated(true)),
+            "down" if self.single_line => cx.emit(Navigated(false)),
             "enter" if self.single_line => cx.emit(Submitted(modifiers.shift)),
             "escape" if self.single_line => cx.emit(Cancelled),
             "z" if command => self.restore_history(modifiers.shift, cx),

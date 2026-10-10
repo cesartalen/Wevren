@@ -11,6 +11,7 @@ mod settings;
 mod theme;
 
 use std::{
+    cmp::Reverse,
     collections::HashSet,
     fmt::Display,
     fs, io,
@@ -19,11 +20,11 @@ use std::{
     time::Duration,
 };
 
-use editor::{Cancelled, Edited, Editor, Followed, Submitted};
+use editor::{Cancelled, Edited, Editor, Followed, Navigated, Submitted};
 use gpui::{
-    AnyElement, App, Application, Bounds, Div, Entity, Focusable, KeyDownEvent, PathPromptOptions,
-    Rgba, SharedString, Stateful, Task, TitlebarOptions, Window, WindowBounds, WindowControlArea,
-    WindowOptions, div, prelude::*, px, relative, size,
+    AnyElement, App, Application, Bounds, Div, Entity, FocusHandle, Focusable, KeyDownEvent,
+    PathPromptOptions, Rgba, SharedString, Stateful, Task, TitlebarOptions, Window, WindowBounds,
+    WindowControlArea, WindowOptions, div, prelude::*, px, relative, size,
 };
 use mimalloc::MiMalloc;
 use settings::Settings;
@@ -60,9 +61,17 @@ struct Find {
     current: Option<usize>,
 }
 
+#[derive(Debug)]
+struct Switcher {
+    input: Entity<Editor>,
+    results: Vec<PathBuf>,
+    selected: usize,
+}
+
 /// The root view.
 #[derive(Debug)]
 struct Wevren {
+    focus: FocusHandle,
     settings: Settings,
     /// Whether the settings page covers the open note.
     settings_open: bool,
@@ -81,6 +90,7 @@ struct Wevren {
     dirty: bool,
     rename_editor: Option<Entity<Editor>>,
     find: Option<Find>,
+    switcher: Option<Switcher>,
 }
 
 impl Wevren {
@@ -101,6 +111,7 @@ impl Wevren {
         })
         .detach();
         let mut this = Self {
+            focus: cx.focus_handle(),
             settings: Settings::load(),
             settings_open: false,
             error: None,
@@ -115,9 +126,197 @@ impl Wevren {
             dirty: false,
             rename_editor: None,
             find: None,
+            switcher: None,
         };
         this.reload(cx);
+        this.focus.focus(window);
         this
+    }
+
+    fn begin_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.folder.is_none() {
+            return;
+        }
+        if self.switcher.is_none() {
+            let input = cx.new(|cx| Editor::single_line(String::new(), cx));
+            cx.subscribe(&input, |this, _, _: &Edited, cx| {
+                this.refresh_switcher(cx);
+            })
+            .detach();
+            cx.subscribe(&input, |this, _, event: &Navigated, cx| {
+                if let Some(switcher) = &mut this.switcher {
+                    let count = switcher.results.len();
+                    if count > 0 {
+                        switcher.selected = if event.0 {
+                            (switcher.selected + count - 1) % count
+                        } else {
+                            (switcher.selected + 1) % count
+                        };
+                    }
+                }
+                cx.notify();
+            })
+            .detach();
+            cx.subscribe_in(&input, window, |this, _, _: &Submitted, window, cx| {
+                let path = this
+                    .switcher
+                    .as_ref()
+                    .and_then(|switcher| switcher.results.get(switcher.selected))
+                    .cloned();
+                if let Some(path) = path {
+                    this.close_switcher(window, cx);
+                    this.open_note(path, window, cx);
+                }
+            })
+            .detach();
+            cx.subscribe_in(&input, window, |this, _, _: &Cancelled, window, cx| {
+                this.close_switcher(window, cx);
+            })
+            .detach();
+            self.switcher = Some(Switcher {
+                input,
+                results: Vec::new(),
+                selected: 0,
+            });
+            self.refresh_switcher(cx);
+        }
+        if let Some(switcher) = &self.switcher {
+            switcher.input.focus_handle(cx).focus(window);
+        }
+        cx.notify();
+    }
+
+    fn refresh_switcher(&mut self, cx: &mut Context<Self>) {
+        let (Some(switcher), Some(root)) = (&mut self.switcher, &self.settings.folder) else {
+            return;
+        };
+        let query = switcher.input.read(cx).text();
+        let mut scored: Vec<_> = self
+            .notes
+            .iter()
+            .filter_map(|path| {
+                let title = notes::title(path);
+                let score = search::fuzzy_score(&title, query).or_else(|| {
+                    search::fuzzy_score(&notes::link_title(path, root), query)
+                        .map(|score| score - 25)
+                })?;
+                Some((Reverse(score), title.to_lowercase(), path.clone()))
+            })
+            .collect();
+        scored.sort();
+        switcher.results = scored
+            .into_iter()
+            .take(10)
+            .map(|(_, _, path)| path)
+            .collect();
+        switcher.selected = 0;
+        cx.notify();
+    }
+
+    fn close_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.switcher = None;
+        if self.open.is_some() && !self.settings_open {
+            self.editor.focus_handle(cx).focus(window);
+        } else {
+            self.focus.focus(window);
+        }
+        cx.notify();
+    }
+
+    fn switcher_page(&self, theme: Theme, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let switcher = self.switcher.as_ref()?;
+        let rows = switcher.results.iter().enumerate().map(|(index, path)| {
+            let path = path.clone();
+            let location = self
+                .settings
+                .folder
+                .as_ref()
+                .map_or_else(String::new, |root| notes::link_title(&path, root));
+            div()
+                .id(index)
+                .flex()
+                .flex_col()
+                .gap_1()
+                .px_4()
+                .py_2()
+                .cursor_pointer()
+                .when(index == switcher.selected, |row| row.bg(theme.hover))
+                .hover(|row| row.bg(theme.hover))
+                .child(div().text_color(theme.text).child(notes::title(&path)))
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme.muted)
+                        .truncate()
+                        .child(location),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.close_switcher(window, cx);
+                    this.open_note(path.clone(), window, cx);
+                    cx.stop_propagation();
+                }))
+        });
+        let panel = div()
+            .id("switcher-panel")
+            .flex()
+            .flex_col()
+            .w(px(520.))
+            .max_w_full()
+            .bg(theme.sheet)
+            .border_1()
+            .border_color(theme.line)
+            .rounded_lg()
+            .shadow_lg()
+            .overflow_hidden()
+            .font_family(theme.ui_font)
+            .text_size(px(14.))
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(label("OPEN NOTE", theme).px_4().pt_3().pb_2())
+            .child(
+                div()
+                    .mx_3()
+                    .mb_2()
+                    .px_3()
+                    .py_2()
+                    .border_1()
+                    .border_color(theme.accent)
+                    .rounded_md()
+                    .child(switcher.input.clone()),
+            )
+            .when(switcher.results.is_empty(), |panel| {
+                panel.child(
+                    div()
+                        .px_4()
+                        .py_3()
+                        .text_color(theme.muted)
+                        .child("No matching notes"),
+                )
+            })
+            .children(rows)
+            .child(
+                div()
+                    .px_4()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(theme.line)
+                    .text_color(theme.muted)
+                    .text_size(px(11.))
+                    .child("Up/Down to choose · Enter to open · Escape to close"),
+            );
+        Some(
+            div()
+                .id("switcher-overlay")
+                .absolute()
+                .size_full()
+                .flex()
+                .justify_center()
+                .items_start()
+                .pt(px(72.))
+                .px_4()
+                .bg(gpui::rgba(0x0000_0066))
+                .on_click(cx.listener(|this, _, window, cx| this.close_switcher(window, cx)))
+                .child(panel),
+        )
     }
 
     /// Returns the value of `result`, keeping its error for display when it failed.
@@ -482,6 +681,13 @@ impl Wevren {
 
     /// Handles the platform's shortcuts for saving and for a new note.
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.switcher.is_some() {
+            if event.keystroke.modifiers.secondary() && event.keystroke.key == "p" {
+                self.close_switcher(window, cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
         if self.find.is_some() {
             match event.keystroke.key.as_str() {
                 "escape" => self.close_find(window, cx),
@@ -503,6 +709,7 @@ impl Wevren {
             return;
         }
         match event.keystroke.key.as_str() {
+            "p" => self.begin_switcher(window, cx),
             "f" => self.begin_find(window, cx),
             "s" => {
                 self.save(cx);
@@ -1066,6 +1273,8 @@ impl Render for Wevren {
             .clone()
             .map(|error| div().px_4().pb_2().text_color(theme.danger).child(error));
         div()
+            .relative()
+            .track_focus(&self.focus)
             .flex()
             .flex_col()
             .size_full()
@@ -1087,6 +1296,7 @@ impl Render for Wevren {
                     .child(page),
             )
             .children(error)
+            .children(self.switcher_page(theme, cx))
     }
 }
 
