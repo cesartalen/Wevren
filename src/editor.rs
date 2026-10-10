@@ -12,7 +12,7 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 
-use crate::theme::Theme;
+use crate::{markdown, theme::Theme};
 
 /// Width of the caret, thin yet visible on dense displays.
 const CARET_WIDTH: Pixels = px(1.5);
@@ -80,6 +80,7 @@ struct Row {
     /// Distance from the top of the editor.
     top: Pixels,
     line: WrappedLine,
+    line_height: Pixels,
 }
 
 /// Editable, soft-wrapped plain text.
@@ -292,10 +293,17 @@ impl Editor {
             let row = &self.rows[row];
             let local = row
                 .line
-                .position_for_index(offset - row.start, self.line_height)?;
+                .position_for_index(offset - row.start, row.line_height)?;
             Some(point(local.x, local.y + row.top))
         })
         .unwrap_or_default()
+    }
+
+    fn height_at(&self, offset: usize) -> Pixels {
+        self.rows
+            .iter()
+            .rfind(|row| row.start <= offset)
+            .map_or(self.line_height, |row| row.line_height)
     }
 
     /// Returns the offset drawn closest to `position`, relative to the first character.
@@ -307,25 +315,31 @@ impl Editor {
         let Some(row) = self.rows.get(row) else {
             return 0;
         };
-        let last_line = row.line.size(self.line_height).height - self.line_height;
+        let last_line = row.line.size(row.line_height).height - row.line_height;
         let y = (position.y - row.top).clamp(Pixels::ZERO, last_line);
         let local = row
             .line
-            .closest_index_for_position(point(position.x, y), self.line_height);
+            .closest_index_for_position(point(position.x, y), row.line_height);
         row.start + local.unwrap_or_else(|index| index)
     }
 
     /// Returns the offset `lines` below the caret, or at `x` on the caret's line.
     fn near_caret(&self, x: Option<Pixels>, lines: f32) -> usize {
         let caret = self.position(self.caret());
-        let y = caret.y + self.line_height * (lines + 0.5);
+        let height = self.height_at(self.caret());
+        let y = if lines < 0. {
+            caret.y - px(1.)
+        } else if lines > 0. {
+            caret.y + height + px(1.)
+        } else {
+            caret.y + height * 0.5
+        };
         self.offset_at(point(x.unwrap_or(caret.x), y))
     }
 
     /// Returns the rectangles covering the selection in an editor of `width`.
     fn selection_quads(&self, width: Pixels, color: Rgba) -> Vec<PaintQuad> {
         let Range { start, end } = self.selection;
-        let height = self.line_height;
         let quad = |from: Point<Pixels>, to: Point<Pixels>| {
             fill(
                 Bounds::from_corners(self.origin + from, self.origin + to),
@@ -334,12 +348,20 @@ impl Editor {
         };
         let mut quads = Vec::new();
         for row in &self.rows {
+            let height = row.line_height;
             let row_end = row.start + row.line.len();
             if start == end || end < row.start || start > row_end {
                 continue;
             }
-            let from = self.position(start.max(row.start));
-            let mut to = self.position(end.min(row_end));
+            let local_position = |offset| {
+                let local = row
+                    .line
+                    .position_for_index(offset - row.start, height)
+                    .unwrap_or_default();
+                point(local.x, local.y + row.top)
+            };
+            let from = local_position(start.max(row.start));
+            let mut to = local_position(end.min(row_end));
             if end > row_end {
                 to.x += BREAK_WIDTH;
             }
@@ -359,28 +381,20 @@ impl Editor {
     }
 
     /// Stores the laid out `lines` and scrolls the caret into view when asked to.
-    fn layout(&mut self, lines: Vec<WrappedLine>, origin: Point<Pixels>, window: &Window) {
+    fn layout(&mut self, rows: Vec<Row>, origin: Point<Pixels>, window: &Window) {
         self.origin = origin;
         self.line_height = window.line_height();
-        let (mut start, mut top) = (0, Pixels::ZERO);
-        self.rows = lines
-            .into_iter()
-            .map(|line| {
-                let row = Row { start, top, line };
-                start += row.line.len() + 1;
-                top += row.line.size(self.line_height).height;
-                row
-            })
-            .collect();
+        self.rows = rows;
         if !mem::take(&mut self.reveal) {
             return;
         }
         let caret = origin.y + self.position(self.caret()).y;
+        let height = self.height_at(self.caret());
         let view = self.scroll.bounds();
         let shift = if caret < view.top() {
             view.top() - caret
-        } else if caret + self.line_height > view.bottom() {
-            view.bottom() - caret - self.line_height
+        } else if caret + height > view.bottom() {
+            view.bottom() - caret - height
         } else {
             return;
         };
@@ -476,10 +490,10 @@ impl Editor {
     fn link_under(&self, position: Point<Pixels>) -> Option<&str> {
         let row = self.rows.iter().rfind(|row| row.top <= position.y)?;
         let local = point(position.x, position.y - row.top);
-        if local.y >= row.line.size(self.line_height).height {
+        if local.y >= row.line.size(row.line_height).height {
             return None;
         }
-        let index = row.line.index_for_position(local, self.line_height).ok()?;
+        let index = row.line.index_for_position(local, row.line_height).ok()?;
         self.link_at(row.start + index)
     }
 
@@ -669,7 +683,7 @@ impl EntityInputHandler for Editor {
     ) -> Option<Bounds<Pixels>> {
         let range = self.range_from_utf16(&range_utf16);
         let mut end = self.position(range.end);
-        end.y += self.line_height;
+        end.y += self.height_at(range.end);
         Some(Bounds::from_corners(
             self.origin + self.position(range.start),
             self.origin + end,
@@ -723,7 +737,7 @@ fn links(text: &str) -> impl Iterator<Item = Range<usize>> {
 }
 
 /// Lays `text` out in hard lines wrapped at `width`, underlining `spans` in their colors.
-fn shape(
+fn shape_line(
     text: SharedString,
     spans: &[(Range<usize>, Hsla)],
     style: &TextStyle,
@@ -755,6 +769,56 @@ fn shape(
         .text_system()
         .shape_text(text, font_size, &runs, width, None);
     lines.map_or_else(|_| Vec::new(), Vec::from_iter)
+}
+
+fn shape(
+    text: &str,
+    spans: &[(Range<usize>, Hsla)],
+    style: &TextStyle,
+    width: Option<Pixels>,
+    markdown: bool,
+    window: &Window,
+) -> Vec<Row> {
+    let headings = if markdown {
+        markdown::headings(text)
+    } else {
+        Vec::new()
+    };
+    let mut rows = Vec::new();
+    let (mut start, mut top) = (0, Pixels::ZERO);
+    for (index, text) in text.split('\n').enumerate() {
+        let end = start + text.len();
+        let spans: Vec<_> = spans
+            .iter()
+            .filter(|(span, _)| span.start < end && span.end > start)
+            .map(|(span, color)| {
+                (
+                    span.start.max(start) - start..span.end.min(end) - start,
+                    *color,
+                )
+            })
+            .collect();
+        let level = headings.get(index).copied().flatten();
+        let scale = level.map_or(1., markdown::heading_scale);
+        let mut line_style = style.clone();
+        if level.is_some() {
+            line_style.font_size = (style.font_size.to_pixels(window.rem_size()) * scale).into();
+            line_style.font_weight = gpui::FontWeight::BOLD;
+        }
+        let line_height = window.line_height() * scale;
+        for line in shape_line(text.to_owned().into(), &spans, &line_style, width, window) {
+            let row = Row {
+                start,
+                top,
+                line,
+                line_height,
+            };
+            top += row.line.size(line_height).height;
+            rows.push(row);
+        }
+        start = end + 1;
+    }
+    rows
 }
 
 /// Draws the text, selection and caret of an [`Editor`] and routes typing to it.
@@ -791,6 +855,7 @@ impl Element for EditorElement {
         let (style, line_height) = (window.text_style(), window.line_height());
         let spans = editor.spans(&style, cx.global::<Theme>().accent);
         let text = editor.text.clone();
+        let markdown = !editor.single_line;
         let mut layout = Style::default();
         layout.size.width = relative(1.).into();
         let id = window.request_measured_layout(layout, move |known, available, window, _cx| {
@@ -798,9 +863,9 @@ impl Element for EditorElement {
                 AvailableSpace::Definite(width) => Some(width),
                 AvailableSpace::MinContent | AvailableSpace::MaxContent => None,
             });
-            let lines = shape(text.clone(), &spans, &style, width, window);
+            let lines = shape(&text, &spans, &style, width, markdown, window);
             let height = lines.iter().fold(Pixels::ZERO, |sum, line| {
-                sum + line.size(line_height).height
+                sum + line.line.size(line.line_height).height
             });
             size(width.unwrap_or_default(), line_height.max(height))
         });
@@ -821,7 +886,14 @@ impl Element for EditorElement {
             let width = Some(bounds.size.width);
             let style = window.text_style();
             let spans = editor.spans(&style, accent);
-            let lines = shape(editor.text.clone(), &spans, &style, width, window);
+            let lines = shape(
+                &editor.text,
+                &spans,
+                &style,
+                width,
+                !editor.single_line,
+                window,
+            );
             editor.layout(lines, bounds.origin, window);
         });
     }
@@ -839,7 +911,6 @@ impl Element for EditorElement {
         let accent = cx.global::<Theme>().accent;
         let editor = self.0.read(cx);
         let (focus, rows, origin) = (editor.focus.clone(), editor.rows.clone(), editor.origin);
-        let line_height = editor.line_height;
         let selection = Rgba {
             a: SELECTION_ALPHA,
             ..accent
@@ -848,7 +919,7 @@ impl Element for EditorElement {
         if editor.selection.is_empty() && focus.is_focused(window) {
             let caret = Bounds::new(
                 origin + editor.position(editor.caret()),
-                size(CARET_WIDTH, line_height),
+                size(CARET_WIDTH, editor.height_at(editor.caret())),
             );
             quads.push(fill(caret, accent));
         }
@@ -861,7 +932,7 @@ impl Element for EditorElement {
             // A line that cannot be painted is left out; there is nothing to fall back to.
             let _ = row
                 .line
-                .paint(at, line_height, TextAlign::Left, None, window, cx);
+                .paint(at, row.line_height, TextAlign::Left, None, window, cx);
         }
     }
 }
