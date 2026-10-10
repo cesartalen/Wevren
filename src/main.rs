@@ -11,6 +11,7 @@ mod settings;
 mod theme;
 
 use std::{
+    collections::HashSet,
     fmt::Display,
     fs, io,
     ops::Range,
@@ -69,6 +70,10 @@ struct Wevren {
     error: Option<SharedString>,
     /// Every note in the notes folder, sorted by title.
     notes: Vec<PathBuf>,
+    entries: Vec<notes::Entry>,
+    expanded: HashSet<PathBuf>,
+    selected_folder: Option<PathBuf>,
+    folder_input: Option<Entity<Editor>>,
     /// The note shown in the editor.
     open: Option<PathBuf>,
     editor: Entity<Editor>,
@@ -100,6 +105,10 @@ impl Wevren {
             settings_open: false,
             error: None,
             notes: Vec::new(),
+            entries: Vec::new(),
+            expanded: HashSet::new(),
+            selected_folder: None,
+            folder_input: None,
             open: None,
             editor,
             autosave: None,
@@ -124,9 +133,27 @@ impl Wevren {
 
     /// Reads the list of notes from the notes folder.
     fn reload(&mut self, cx: &mut App) {
-        let notes = self.settings.folder.as_deref().map(notes::list).transpose();
-        self.notes = self.report(notes).flatten().unwrap_or_default();
-        let titles = self.notes.iter().map(|path| notes::title(path)).collect();
+        let entries = self.settings.folder.as_deref().map(notes::scan).transpose();
+        if let Some(entries) = self.report(entries) {
+            self.entries = entries.unwrap_or_default();
+        }
+        self.notes = self
+            .entries
+            .iter()
+            .filter(|entry| !entry.directory)
+            .map(|entry| entry.path.clone())
+            .collect();
+        self.expanded.retain(|path| {
+            self.entries
+                .iter()
+                .any(|entry| entry.directory && entry.path == *path)
+        });
+        let titles = self.settings.folder.as_ref().map_or_else(Vec::new, |root| {
+            self.notes
+                .iter()
+                .map(|path| notes::link_title(path, root))
+                .collect()
+        });
         self.editor.update(cx, |editor, cx| {
             editor.set_note_titles(titles, cx);
         });
@@ -161,6 +188,10 @@ impl Wevren {
         self.open = None;
         self.rename_editor = None;
         self.find = None;
+        self.expanded.clear();
+        self.entries.clear();
+        self.selected_folder = Some(folder.clone());
+        self.folder_input = None;
         self.settings.folder = Some(folder);
         self.report(self.settings.save());
         self.settings_open |= self.error.is_some();
@@ -179,9 +210,68 @@ impl Wevren {
                 .update(cx, |editor, cx| editor.set_text(text, cx));
             self.editor.focus_handle(cx).focus(window);
             self.open = Some(path);
+            self.selected_folder = self
+                .open
+                .as_ref()
+                .and_then(|path| path.parent().map(Path::to_path_buf));
+            self.reveal_open();
             self.rename_editor = None;
             self.find = None;
             self.settings_open = false;
+        }
+        cx.notify();
+    }
+
+    fn reveal_open(&mut self) {
+        if let (Some(path), Some(root)) = (&self.open, &self.settings.folder) {
+            for parent in path
+                .ancestors()
+                .skip(1)
+                .take_while(|parent| *parent != root && parent.starts_with(root))
+            {
+                self.expanded.insert(parent.to_path_buf());
+            }
+        }
+    }
+
+    fn destination(&self) -> Option<PathBuf> {
+        self.selected_folder
+            .clone()
+            .or_else(|| self.settings.folder.clone())
+    }
+
+    fn begin_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.destination().is_none() {
+            return;
+        }
+        let input = cx.new(|cx| Editor::single_line(String::new(), cx));
+        cx.subscribe_in(&input, window, |this, _, _: &Submitted, _, cx| {
+            this.finish_folder(cx);
+        })
+        .detach();
+        cx.subscribe_in(&input, window, |this, _, _: &Cancelled, window, cx| {
+            this.folder_input = None;
+            this.editor.focus_handle(cx).focus(window);
+            cx.notify();
+        })
+        .detach();
+        input.focus_handle(cx).focus(window);
+        self.folder_input = Some(input);
+        cx.notify();
+    }
+
+    fn finish_folder(&mut self, cx: &mut Context<Self>) {
+        let (Some(parent), Some(input)) = (self.destination(), &self.folder_input) else {
+            return;
+        };
+        let name = input.read(cx).text().trim().to_owned();
+        self.error = None;
+        if let Some(path) = self.report(notes::create_folder(&parent, &name)) {
+            self.expanded.insert(parent);
+            self.expanded.insert(path.clone());
+            self.selected_folder = Some(path);
+            self.folder_input = None;
+            self.reload(cx);
         }
         cx.notify();
     }
@@ -356,7 +446,7 @@ impl Wevren {
 
     /// Creates an empty note and opens it.
     fn new_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(folder) = self.settings.folder.clone() else {
+        let Some(folder) = self.destination() else {
             return;
         };
         self.open_created(notes::create_untitled(&folder), window, cx);
@@ -367,12 +457,12 @@ impl Wevren {
         let Some(folder) = self.settings.folder.clone() else {
             return;
         };
-        let wanted = title.to_lowercase();
-        let mut notes = self.notes.iter();
-        let existing = notes.find(|path| notes::title(path).to_lowercase() == wanted);
-        let path = existing
-            .cloned()
-            .map_or_else(|| notes::create(&folder, title), Ok);
+        let current = self
+            .open
+            .as_ref()
+            .and_then(|path| path.parent())
+            .unwrap_or(&folder);
+        let path = notes::resolve(&folder, current, title, &self.notes);
         self.open_created(path, window, cx);
     }
 
@@ -431,6 +521,59 @@ impl Wevren {
             .font_family(theme.text_font)
             .text_color(theme.faint)
             .child("No notes yet");
+        let header = Self::sidebar_header(theme, cx);
+        let root = self.settings.folder.as_deref();
+        let rows = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .path
+                    .ancestors()
+                    .skip(1)
+                    .take_while(|parent| Some(*parent) != root)
+                    .all(|parent| self.expanded.contains(parent))
+            })
+            .map(|entry| self.sidebar_row(entry, theme, cx));
+        let folder_input = self.folder_input.as_ref().map(|input| {
+            div()
+                .px_3()
+                .py_2()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(label("NEW FOLDER (ENTER TO CREATE)", theme))
+                .child(
+                    div()
+                        .border_1()
+                        .border_color(theme.accent)
+                        .rounded_md()
+                        .px_2()
+                        .py_1()
+                        .child(input.clone()),
+                )
+                .child(
+                    div().text_size(px(11.)).text_color(theme.muted).child(
+                        self.destination()
+                            .map_or_else(String::new, |path| path.display().to_string()),
+                    ),
+                )
+        });
+        div()
+            .id("notes")
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w(px(SIDEBAR_WIDTH))
+            .pt_3()
+            .overflow_y_scroll()
+            .child(header)
+            .children(folder_input)
+            .when(self.entries.is_empty(), |list| list.child(empty))
+            .children(rows)
+    }
+
+    fn sidebar_header(theme: Theme, cx: &mut Context<Self>) -> Div {
         let add = div()
             .id("new-note")
             .flex()
@@ -445,7 +588,7 @@ impl Wevren {
             .hover(|s| s.bg(theme.hover).text_color(theme.text))
             .on_click(cx.listener(|this, _, window, cx| this.new_note(window, cx)))
             .child(ADD_GLYPH);
-        let header = div()
+        div()
             .flex()
             .flex_none()
             .items_center()
@@ -453,46 +596,111 @@ impl Wevren {
             .pl_3()
             .pr_1()
             .pb_1()
-            .child(label("NOTES", theme))
-            .child(add);
-        let rows = self.notes.iter().enumerate().map(|(index, path)| {
-            let active = self.open.as_ref() == Some(path);
-            let path = path.clone();
+            .child(
+                label("NOTES", theme)
+                    .id("workspace-root")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.selected_folder = this.settings.folder.clone();
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("new-folder")
+                            .cursor_pointer()
+                            .text_size(px(11.))
+                            .text_color(theme.muted)
+                            .hover(|style| style.text_color(theme.text))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.begin_folder(window, cx)),
+                            )
+                            .child("+ Folder"),
+                    )
+                    .child(add),
+            )
+    }
+
+    fn sidebar_row(
+        &self,
+        entry: &notes::Entry,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let root = self.settings.folder.as_deref();
+        let directory = entry.directory;
+        let active = if directory {
+            self.selected_folder.as_ref() == Some(&entry.path)
+        } else {
+            self.open.as_ref() == Some(&entry.path)
+        };
+        let expanded = self.expanded.contains(&entry.path);
+        let indent = entry
+            .path
+            .strip_prefix(root.unwrap_or(Path::new("")))
+            .map_or(0., |path| {
+                path.components().skip(1).fold(0., |indent, _| indent + 14.)
+            });
+        let name = if directory {
+            entry
+                .path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            notes::title(&entry.path)
+        };
+        let path = entry.path.clone();
+        let marker = if directory {
             div()
-                .id(index)
                 .flex()
                 .flex_none()
                 .items_center()
-                .h(px(32.))
-                .pr_3()
-                .rounded_md()
-                .cursor_pointer()
-                .font_family(theme.text_font)
-                .text_color(if active { theme.text } else { theme.muted })
-                .hover(|s| s.bg(theme.hover).text_color(theme.text))
-                .child(knot(active, theme))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .child(notes::title(&path)),
-                )
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_note(path.clone(), window, cx);
-                }))
-        });
+                .justify_center()
+                .w(px(28.))
+                .h_full()
+                .font_family(theme.ui_font)
+                .child(if expanded { "\u{25be}" } else { "\u{25b8}" })
+        } else {
+            knot(active, theme)
+        };
         div()
-            .id("notes")
+            .id(SharedString::from(path.to_string_lossy().into_owned()))
             .flex()
-            .flex_col()
             .flex_none()
-            .w(px(SIDEBAR_WIDTH))
-            .pt_3()
-            .overflow_y_scroll()
-            .child(header)
-            .when(self.notes.is_empty(), |list| list.child(empty))
-            .children(rows)
+            .items_center()
+            .h(px(32.))
+            .pl(px(indent))
+            .pr_3()
+            .rounded_md()
+            .cursor_pointer()
+            .font_family(if directory {
+                theme.ui_font
+            } else {
+                theme.text_font
+            })
+            .text_color(if active { theme.text } else { theme.muted })
+            .when(directory && active, |row| row.bg(theme.hover))
+            .hover(|style| style.bg(theme.hover).text_color(theme.text))
+            .child(marker)
+            .child(div().flex_1().min_w_0().truncate().child(name))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if directory {
+                    this.selected_folder = Some(path.clone());
+                    if !this.expanded.remove(&path) {
+                        this.expanded.insert(path.clone());
+                    }
+                    cx.notify();
+                } else {
+                    this.open_note(path.clone(), window, cx);
+                }
+            }))
     }
 
     /// Returns the page a note is read and edited on.
