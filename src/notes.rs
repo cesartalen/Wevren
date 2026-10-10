@@ -1,12 +1,37 @@
 //! Notes stored as Markdown files in a folder.
 
 use std::{
-    fs, io,
+    fs::{self, File},
+    io,
     path::{Path, PathBuf},
 };
 
 /// File extension that marks a file as a note.
 const EXTENSION: &str = "md";
+/// Title a note carries until it is given one.
+const UNTITLED: &str = "Untitled";
+
+/// Creates an empty note in `folder` and returns its path.
+///
+/// The note is titled "Untitled", with a number added when that is taken.
+///
+/// # Errors
+///
+/// Fails when the file cannot be created.
+pub fn create(folder: &Path) -> io::Result<PathBuf> {
+    let mut number = 1;
+    loop {
+        let title = match number {
+            1 => UNTITLED.to_owned(),
+            _ => format!("{UNTITLED} {number}"),
+        };
+        let path = folder.join(format!("{title}.{EXTENSION}"));
+        match File::create_new(&path) {
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => number += 1,
+            created => return created.map(|_| path),
+        }
+    }
+}
 
 /// Returns the notes in `folder`, sorted by title.
 ///

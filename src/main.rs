@@ -43,6 +43,8 @@ const ICON_FONT: &str = "Segoe Fluent Icons";
 const CAPTION_GLYPHS: [&str; 3] = ["\u{e921}", "\u{e922}", "\u{e8bb}"];
 /// Gear glyph in [`ICON_FONT`].
 const SETTINGS_GLYPH: &str = "\u{e713}";
+/// Plus glyph in [`ICON_FONT`].
+const ADD_GLYPH: &str = "\u{e710}";
 /// Pause after the last edit before a note is written, sparing the disk while typing.
 const AUTOSAVE_DELAY: Duration = Duration::from_secs(1);
 
@@ -166,14 +168,31 @@ impl Wevren {
         }
     }
 
-    /// Saves on the platform's save shortcut.
-    fn key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let modifiers = event.keystroke.modifiers;
-        if event.keystroke.key == "s" && modifiers.secondary() && !modifiers.alt {
-            self.save(cx);
-            cx.notify();
-            cx.stop_propagation();
+    /// Creates an empty note and opens it.
+    fn new_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(folder) = self.settings.folder.clone() else {
+            return;
+        };
+        if let Some(path) = self.report(notes::create(&folder)) {
+            self.reload();
+            self.open_note(path, window, cx);
         }
+        cx.notify();
+    }
+
+    /// Handles the platform's shortcuts for saving and for a new note.
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let modifiers = event.keystroke.modifiers;
+        if !modifiers.secondary() || modifiers.alt {
+            return;
+        }
+        match event.keystroke.key.as_str() {
+            "s" => self.save(cx),
+            "n" => self.new_note(window, cx),
+            _ => return,
+        }
+        cx.notify();
+        cx.stop_propagation();
     }
 
     /// Returns the note list.
@@ -183,6 +202,30 @@ impl Wevren {
             .font_family(theme.text_font)
             .text_color(theme.faint)
             .child("No notes yet");
+        let add = div()
+            .id("new-note")
+            .flex()
+            .items_center()
+            .justify_center()
+            .size_6()
+            .rounded_md()
+            .font_family(ICON_FONT)
+            .text_size(px(11.))
+            .text_color(theme.muted)
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.hover).text_color(theme.text))
+            .on_click(cx.listener(|this, _, window, cx| this.new_note(window, cx)))
+            .child(ADD_GLYPH);
+        let header = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_between()
+            .pl_3()
+            .pr_1()
+            .pb_1()
+            .child(label("NOTES", theme))
+            .child(add);
         let rows = self.notes.iter().enumerate().map(|(index, path)| {
             let active = self.open.as_ref() == Some(path);
             let path = path.clone();
@@ -218,7 +261,7 @@ impl Wevren {
             .w(px(SIDEBAR_WIDTH))
             .pt_3()
             .overflow_y_scroll()
-            .child(label("NOTES", theme).px_3().pb_2())
+            .child(header)
             .when(self.notes.is_empty(), |list| list.child(empty))
             .children(rows)
     }
