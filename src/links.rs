@@ -11,7 +11,7 @@ struct Update {
     after: String,
 }
 
-struct Rename<'a> {
+struct Relocation<'a> {
     root: &'a Path,
     old: &'a Path,
     new: &'a Path,
@@ -19,19 +19,32 @@ struct Rename<'a> {
     after: &'a [PathBuf],
 }
 
-impl Rename<'_> {
+impl Relocation<'_> {
     fn target(&self, source: &Path, target: &str) -> Option<String> {
         let parent = source.parent()?;
-        if notes::find(self.root, parent, target, self.before) != Some(self.old) {
+        let resolved = notes::find(self.root, parent, target, self.before)?;
+        let destination = if resolved == self.old {
+            self.new
+        } else {
+            resolved
+        };
+        let new_parent = if source == self.old {
+            self.new.parent()?
+        } else {
+            parent
+        };
+        if resolved != self.old
+            && notes::find(self.root, new_parent, target, self.after) == Some(destination)
+        {
             return None;
         }
-        let title = notes::title(self.new);
+        let title = notes::title(destination);
         if !target.contains(['/', '\\'])
-            && notes::find(self.root, parent, &title, self.after) == Some(self.new)
+            && notes::find(self.root, new_parent, &title, self.after) == Some(destination)
         {
             return Some(title);
         }
-        let qualified = notes::link_title(self.new, self.root);
+        let qualified = notes::link_title(destination, self.root);
         Some(if qualified.contains('/') {
             qualified
         } else {
@@ -118,6 +131,30 @@ pub fn rename(
     title: &str,
     baseline: &str,
 ) -> io::Result<(PathBuf, String)> {
+    let new = notes::rename_target(old, title)?;
+    relocate(root, old, &new, baseline)
+}
+
+pub fn move_note(
+    root: &Path,
+    old: &Path,
+    folder: &Path,
+    baseline: &str,
+) -> io::Result<(PathBuf, String)> {
+    if !folder.is_dir() || !std::fs::canonicalize(folder)?.starts_with(std::fs::canonicalize(root)?)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Choose a folder inside this workspace.",
+        ));
+    }
+    let name = old
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "The note has no file name."))?;
+    relocate(root, old, &folder.join(name), baseline)
+}
+
+fn relocate(root: &Path, old: &Path, new: &Path, baseline: &str) -> io::Result<(PathBuf, String)> {
     let before: Vec<_> = notes::scan(root)?
         .into_iter()
         .filter(|entry| !entry.directory)
@@ -125,47 +162,46 @@ pub fn rename(
         .collect();
     if notes::read(old)? != baseline {
         return Err(io::Error::other(
-            "The note changed outside Wevren. Resolve the conflict before renaming.",
+            "The note changed outside Wevren. Resolve the conflict before moving or renaming it.",
         ));
     }
-    let new = old.with_file_name(format!("{title}.md"));
     if new == old {
-        return Ok((new, baseline.to_owned()));
+        return Ok((new.to_path_buf(), baseline.to_owned()));
     }
     let after: Vec<_> = before
         .iter()
         .map(|path| {
             if path == old {
-                new.clone()
+                new.to_path_buf()
             } else {
                 path.clone()
             }
         })
         .collect();
-    let rename = Rename {
+    let relocation = Relocation {
         root,
         old,
-        new: &new,
+        new,
         before: &before,
         after: &after,
     };
     let mut updates = Vec::new();
-    let mut renamed_text = baseline.to_owned();
+    let mut updated_text = baseline.to_owned();
     for path in &before {
         let text = notes::read(path)?;
         if path == old && text != baseline {
             return Err(io::Error::other(
-                "The note changed outside Wevren. Resolve the conflict before renaming.",
+                "The note changed outside Wevren. Resolve the conflict before moving or renaming it.",
             ));
         }
-        let rewritten = rename.rewrite(path, &text);
+        let rewritten = relocation.rewrite(path, &text);
         if path == old {
-            renamed_text.clone_from(&rewritten);
+            updated_text.clone_from(&rewritten);
         }
         if rewritten != text || path == old {
             updates.push(Update {
                 path: if path == old {
-                    new.clone()
+                    new.to_path_buf()
                 } else {
                     path.clone()
                 },
@@ -182,16 +218,16 @@ pub fn rename(
         };
         if notes::disk_text(source)?.as_deref() != Some(&update.before) {
             return Err(io::Error::other(format!(
-                "{} changed outside Wevren; rename cancelled",
+                "{} changed outside Wevren; operation cancelled",
                 source.display()
             )));
         }
     }
-    let renamed = notes::rename(old, title)?;
+    notes::rename_to(old, new)?;
     if let Err((applied, error)) = apply(&updates) {
-        return Err(rollback(&updates[..applied], &renamed, old, &error));
+        return Err(rollback(&updates[..applied], new, old, &error));
     }
-    Ok((renamed, renamed_text))
+    Ok((new.to_path_buf(), updated_text))
 }
 
 fn apply(updates: &[Update]) -> Result<(), (usize, io::Error)> {
@@ -228,10 +264,10 @@ fn rollback(updates: &[Update], renamed: &Path, old: &Path, error: &io::Error) -
         failures.push(rollback.to_string());
     }
     io::Error::other(if failures.is_empty() {
-        format!("Rename cancelled; original links restored. {error}")
+        format!("Note change cancelled; original links restored. {error}")
     } else {
         format!(
-            "Rename interrupted: {error}. Some files changed again and could not be restored: {}",
+            "Note change interrupted: {error}. Some files changed again and could not be restored: {}",
             failures.join(", ")
         )
     })

@@ -117,6 +117,7 @@ struct Wevren {
     navigation_index: Option<usize>,
     tabs: Vec<Tab>,
     content_search: Option<Task<anyhow::Result<()>>>,
+    move_picker: bool,
 }
 
 impl Wevren {
@@ -152,6 +153,7 @@ impl Wevren {
             navigation_index: None,
             tabs: Vec::new(),
             content_search: None,
+            move_picker: false,
         };
         this.reload(cx);
         this.focus.focus(window);
@@ -698,6 +700,7 @@ impl Wevren {
         self.navigation.clear();
         self.navigation_index = None;
         self.tabs.clear();
+        self.move_picker = false;
         self.entries.clear();
         self.selected_folder = Some(folder.clone());
         self.folder_input = None;
@@ -1293,27 +1296,208 @@ impl Wevren {
             if let Some((renamed, text)) =
                 self.report(links::rename(&root, &path, &title, &baseline))
             {
-                for visited in &mut self.navigation {
-                    if *visited == path {
-                        visited.clone_from(&renamed);
-                    }
-                }
-                for tab in &mut self.tabs {
-                    if tab.path == path {
-                        tab.path.clone_from(&renamed);
-                    }
-                }
-                self.open = Some(renamed);
-                self.baseline = Some(text.clone());
-                self.disk_revision = self.disk_revision.wrapping_add(1);
-                self.editor
-                    .update(cx, |editor, cx| editor.reload_text(text, cx));
-                self.refresh_find(false, cx);
-                self.reload(cx);
-                self.cancel_rename(window, cx);
+                self.apply_relocation(&path, renamed, text, window, cx);
             }
         }
         cx.notify();
+    }
+
+    fn apply_relocation(
+        &mut self,
+        old: &Path,
+        path: PathBuf,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for visited in &mut self.navigation {
+            if *visited == old {
+                visited.clone_from(&path);
+            }
+        }
+        self.tabs.retain(|tab| tab.path != path || tab.path == old);
+        for tab in &mut self.tabs {
+            if tab.path == old {
+                tab.path.clone_from(&path);
+            }
+        }
+        self.selected_folder = path.parent().map(Path::to_path_buf);
+        self.open = Some(path);
+        self.baseline = Some(text.clone());
+        self.disk_revision = self.disk_revision.wrapping_add(1);
+        if self.editor.read(cx).text() != text {
+            self.editor
+                .update(cx, |editor, cx| editor.reload_text(text, cx));
+        }
+        self.refresh_find(false, cx);
+        self.reload(cx);
+        self.reveal_open();
+        self.move_picker = false;
+        self.cancel_rename(window, cx);
+    }
+
+    fn begin_move(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.open.is_none() || self.rename_editor.is_some() {
+            return;
+        }
+        self.settings_open = false;
+        if self.save(cx) {
+            self.move_picker = true;
+            self.focus.focus(window);
+        }
+        cx.notify();
+    }
+
+    fn cancel_move(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_picker = false;
+        self.editor.focus_handle(cx).focus(window);
+        cx.notify();
+    }
+
+    fn finish_move(&mut self, folder: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(path), Some(root)) = (self.open.clone(), self.settings.folder.clone()) else {
+            return;
+        };
+        self.error = None;
+        if self.save(cx) {
+            let baseline = self.baseline.clone().unwrap_or_default();
+            if let Some((moved, text)) =
+                self.report(links::move_note(&root, &path, folder, &baseline))
+            {
+                self.apply_relocation(&path, moved, text, window, cx);
+            }
+        }
+        self.cancel_move(window, cx);
+    }
+
+    fn move_rows(
+        &self,
+        root: &Path,
+        note: &Path,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<Stateful<Div>> {
+        let folders = std::iter::once(root).chain(
+            self.entries
+                .iter()
+                .filter(|entry| entry.directory)
+                .map(|entry| entry.path.as_path()),
+        );
+        folders
+            .enumerate()
+            .map(|(index, folder)| {
+                let current = note.parent() == Some(folder);
+                let occupied = !current
+                    && note
+                        .file_name()
+                        .is_some_and(|name| folder.join(name).exists());
+                let label = if folder == root {
+                    "Workspace root".to_owned()
+                } else {
+                    folder
+                        .strip_prefix(root)
+                        .unwrap_or(folder)
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                };
+                let folder = folder.to_path_buf();
+                div()
+                    .id(("move-folder", index))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .px_4()
+                    .py_2()
+                    .text_color(theme.text)
+                    .when(!current && !occupied, |row| {
+                        row.cursor_pointer().hover(|row| row.bg(theme.hover))
+                    })
+                    .child(div().min_w_0().truncate().child(label))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(theme.muted)
+                            .text_size(px(11.))
+                            .child(if current {
+                                "Current folder"
+                            } else if occupied {
+                                "Name already exists"
+                            } else {
+                                ""
+                            }),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        if !current && !occupied {
+                            this.finish_move(&folder, window, cx);
+                        }
+                    }))
+            })
+            .collect()
+    }
+
+    fn move_page(&self, theme: Theme, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        if !self.move_picker {
+            return None;
+        }
+        let (Some(root), Some(note)) = (&self.settings.folder, &self.open) else {
+            return None;
+        };
+        let rows = self.move_rows(root, note, theme, cx);
+        let panel = div()
+            .id("move-panel")
+            .flex()
+            .flex_col()
+            .w(px(440.))
+            .max_w_full()
+            .bg(theme.sheet)
+            .border_1()
+            .border_color(theme.line)
+            .rounded_lg()
+            .shadow_lg()
+            .overflow_hidden()
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(label("MOVE NOTE", theme).px_4().pt_3().pb_2())
+            .child(
+                div()
+                    .px_4()
+                    .pb_2()
+                    .text_color(theme.muted)
+                    .child(notes::title(note)),
+            )
+            .child(
+                div()
+                    .id("move-folders")
+                    .max_h(px(340.))
+                    .overflow_y_scroll()
+                    .children(rows),
+            )
+            .child(
+                div()
+                    .id("cancel-move")
+                    .px_4()
+                    .py_3()
+                    .cursor_pointer()
+                    .text_color(theme.muted)
+                    .hover(|button| button.text_color(theme.text))
+                    .on_click(cx.listener(|this, _, window, cx| this.cancel_move(window, cx)))
+                    .child("Cancel"),
+            );
+        Some(
+            div()
+                .id("move-overlay")
+                .absolute()
+                .size_full()
+                .flex()
+                .justify_center()
+                .items_start()
+                .pt(px(72.))
+                .px_4()
+                .bg(gpui::rgba(0x0000_0066))
+                .on_click(cx.listener(|this, _, window, cx| this.cancel_move(window, cx)))
+                .child(panel),
+        )
     }
 
     /// Creates an empty note and opens it.
@@ -1354,6 +1538,13 @@ impl Wevren {
 
     /// Handles the platform's shortcuts for saving and for a new note.
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.move_picker {
+            if event.keystroke.key == "escape" {
+                self.cancel_move(window, cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
         if self.switcher.is_none()
             && event.keystroke.modifiers.alt
             && matches!(event.keystroke.key.as_str(), "left" | "right")
@@ -1397,6 +1588,7 @@ impl Wevren {
                 self.save(cx);
             }
             "n" => self.new_note(window, cx),
+            "m" if modifiers.shift => self.begin_move(window, cx),
             "tab" => self.step_tab(modifiers.shift, window, cx),
             "w" => {
                 if let Some(path) = self.open.clone() {
@@ -1666,7 +1858,29 @@ impl Wevren {
             .min_h_full()
             .pb_8()
             .line_height(relative(1.7))
-            .child(title)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .child(div().flex_1().min_w_0().child(title))
+                    .when(self.rename_editor.is_none(), |row| {
+                        row.child(
+                            div()
+                                .id("move-note")
+                                .flex_none()
+                                .text_size(px(12.))
+                                .text_color(theme.muted)
+                                .cursor_pointer()
+                                .hover(|button| button.text_color(theme.accent))
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.begin_move(window, cx)),
+                                )
+                                .child("Move"),
+                        )
+                    }),
+            )
             .child(rule(theme))
             .child(self.editor.clone());
         let scroll = div()
@@ -2055,6 +2269,7 @@ impl Render for Wevren {
             )
             .children(error)
             .children(self.switcher_page(theme, cx))
+            .children(self.move_page(theme, cx))
     }
 }
 

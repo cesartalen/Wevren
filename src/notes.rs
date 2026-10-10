@@ -225,11 +225,9 @@ fn validate_title(title: &str) -> io::Result<()> {
     Ok(())
 }
 
-pub fn rename(path: &Path, title: &str) -> io::Result<PathBuf> {
+pub fn rename_target(path: &Path, title: &str) -> io::Result<PathBuf> {
     validate_title(title)?;
-    let target = path.with_file_name(format!("{title}.{EXTENSION}"));
-    rename_to(path, &target)?;
-    Ok(target)
+    Ok(path.with_file_name(format!("{title}.{EXTENSION}")))
 }
 
 pub fn rename_to(path: &Path, target: &Path) -> io::Result<()> {
