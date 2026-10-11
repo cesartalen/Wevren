@@ -2338,30 +2338,7 @@ impl Wevren {
             .min_h_full()
             .pb_8()
             .line_height(relative(1.7))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_4()
-                    .child(div().flex_1().min_w_0().child(title))
-                    .when(!active || self.rename_editor.is_none(), |row| {
-                        row.child(
-                            div()
-                                .id(("move-note", pane))
-                                .flex_none()
-                                .text_size(px(12.))
-                                .text_color(theme.muted)
-                                .cursor_pointer()
-                                .hover(|button| button.text_color(theme.accent))
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.select_pane(pane, window, cx);
-                                    this.begin_move(window, cx);
-                                }))
-                                .child("Move"),
-                        )
-                    }),
-            )
+            .child(title)
             .child(rule(theme))
             .child(editor.clone());
         let scroll = div()
