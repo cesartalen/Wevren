@@ -1753,6 +1753,21 @@ impl Wevren {
         self.cancel_move(window, cx);
     }
 
+    /// Moves the note dragged from the note list into `folder`.
+    fn drop_note(
+        &mut self,
+        note: &Path,
+        folder: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if note.parent() != Some(folder)
+            && self.open_note_with_history(note.to_path_buf(), true, window, cx)
+        {
+            self.finish_move(folder, window, cx);
+        }
+    }
+
     fn move_rows(
         &self,
         root: &Path,
@@ -1993,6 +2008,11 @@ impl Wevren {
             .text_color(theme.faint)
             .child("No notes yet");
         let header = Self::sidebar_header(theme, cx);
+        let drop_root = cx.listener(|this, note: &DraggedNote, window, cx| {
+            if let Some(root) = this.settings.folder.clone() {
+                this.drop_note(&note.0, &root, window, cx);
+            }
+        });
         let root = self.settings.folder.as_deref();
         let rows = self
             .entries
@@ -2038,6 +2058,7 @@ impl Wevren {
             .w(px(SIDEBAR_WIDTH))
             .pt_3()
             .overflow_y_scroll()
+            .on_drop(drop_root)
             .child(header)
             .children(folder_input)
             .when(self.entries.is_empty(), |list| list.child(empty))
@@ -2141,6 +2162,11 @@ impl Wevren {
             notes::title(&entry.path)
         };
         let path = entry.path.clone();
+        let folder = if directory {
+            Some(path.clone())
+        } else {
+            path.parent().map(Path::to_path_buf)
+        };
         let marker = if directory {
             div()
                 .flex()
@@ -2174,6 +2200,19 @@ impl Wevren {
             .hover(|style| style.bg(theme.hover).text_color(theme.text))
             .child(marker)
             .child(div().flex_1().min_w_0().truncate().child(name))
+            .when(directory, |row| {
+                row.drag_over::<DraggedNote>(move |style, _, _, _| style.bg(theme.hover))
+            })
+            .when(!directory, |row| {
+                row.on_drag(DraggedNote(path.clone()), |note, _, _, cx| {
+                    cx.new(|_| note.clone())
+                })
+            })
+            .on_drop(cx.listener(move |this, note: &DraggedNote, window, cx| {
+                if let Some(folder) = &folder {
+                    this.drop_note(&note.0, folder, window, cx);
+                }
+            }))
             .on_click(cx.listener(move |this, _, window, cx| {
                 if directory {
                     this.selected_folder = Some(path.clone());
@@ -2672,6 +2711,26 @@ fn empty_page(theme: Theme) -> AnyElement {
         .child(rule(theme))
         .child("No note is open")
         .into_any_element()
+}
+
+/// Note dragged from the note list, shown under the pointer by its title.
+#[derive(Clone)]
+struct DraggedNote(PathBuf);
+
+impl Render for DraggedNote {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.global::<Theme>();
+        div()
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.line)
+            .bg(theme.sheet)
+            .font_family(theme.text_font)
+            .text_color(theme.text)
+            .child(notes::title(&self.0))
+    }
 }
 
 impl Render for Wevren {
