@@ -27,8 +27,8 @@ use std::{
 use editor::{Cancelled, Edited, Editor, Followed, Navigated, Submitted};
 use gpui::{
     AnyElement, App, Application, Bounds, Div, Entity, FocusHandle, Focusable, KeyDownEvent,
-    PathPromptOptions, Rgba, SharedString, Stateful, Task, TitlebarOptions, Window, WindowBounds,
-    WindowControlArea, WindowOptions, div, prelude::*, px, relative, size,
+    MouseButton, PathPromptOptions, Rgba, SharedString, Stateful, Task, TitlebarOptions, Window,
+    WindowBounds, WindowControlArea, WindowOptions, div, prelude::*, px, relative, size,
 };
 use mimalloc::MiMalloc;
 use settings::Settings;
@@ -2394,6 +2394,13 @@ impl Wevren {
         );
         div()
             .id(("pane", pane))
+            .capture_any_mouse_down(cx.listener(
+                move |this, event: &gpui::MouseDownEvent, window, cx| {
+                    if event.button == MouseButton::Left && this.layout.active != pane {
+                        this.select_pane(pane, window, cx);
+                    }
+                },
+            ))
             .flex()
             .flex_col()
             .flex_1()
