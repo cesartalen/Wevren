@@ -2700,7 +2700,6 @@ impl Render for Wevren {
             .map(|error| div().px_4().pb_2().text_color(theme.danger).child(error));
         div()
             .relative()
-            .track_focus(&self.focus)
             .flex()
             .flex_col()
             .size_full()
@@ -2717,6 +2716,7 @@ impl Render for Wevren {
             ))
             .child(
                 div()
+                    .track_focus(&self.focus)
                     .flex()
                     .flex_1()
                     .min_h_0()
