@@ -14,7 +14,7 @@ use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::{
     completion::{self, Completion},
-    markdown,
+    formatting, markdown,
     theme::Theme,
 };
 
@@ -469,6 +469,16 @@ impl Editor {
         }
     }
 
+    fn format(&mut self, command: formatting::Command, cx: &mut Context<Self>) {
+        let Some(edit) = formatting::transform(&self.text, self.selection.clone(), command) else {
+            return;
+        };
+        self.replace(edit.range, &edit.text, cx);
+        self.selection = edit.selection;
+        self.completion = None;
+        cx.notify();
+    }
+
     fn restore_history(&mut self, redo: bool, cx: &mut Context<Self>) {
         let current = self.snapshot();
         let state = if redo {
@@ -670,6 +680,15 @@ impl Editor {
         let step = select || self.selection.is_empty();
         // AltGr reports as control and alt together, and must keep typing characters.
         let command = modifiers.secondary() && !modifiers.alt;
+        if command
+            && !self.single_line
+            && self.marked.is_none()
+            && let Some(formatting) = formatting::shortcut(key, modifiers.shift)
+        {
+            self.format(formatting, cx);
+            cx.stop_propagation();
+            return;
+        }
         if command && key == "tab" {
             return;
         }

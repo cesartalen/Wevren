@@ -30,9 +30,9 @@ struct Delimiter {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Fence {
-    marker: u8,
-    length: usize,
+pub(crate) struct Fence {
+    pub marker: u8,
+    pub length: usize,
 }
 
 fn unindented(line: &str) -> Option<&str> {
@@ -40,7 +40,7 @@ fn unindented(line: &str) -> Option<&str> {
     (line.len() - trimmed.len() <= 3).then_some(trimmed)
 }
 
-fn fence(line: &str) -> Option<(Fence, &str)> {
+pub(crate) fn fence(line: &str) -> Option<(Fence, &str)> {
     let line = unindented(line)?;
     let marker = *line.as_bytes().first()?;
     if !matches!(marker, b'`' | b'~') {

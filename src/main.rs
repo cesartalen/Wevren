@@ -4,6 +4,7 @@
 
 mod completion;
 mod editor;
+mod formatting;
 mod links;
 mod markdown;
 mod notes;
@@ -2595,6 +2596,21 @@ impl Wevren {
                     .hover(|s| s.bg(theme.hover))
                     .on_click(cx.listener(|_, _, _, cx| Self::choose_folder(cx)))
                     .child(action),
+            )
+            .child(rule(theme))
+            .child(label("FORMATTING SHORTCUTS", theme))
+            .child(
+                div().flex().flex_col().gap_2().children(
+                    [
+                        "Ctrl+B — Bold",
+                        "Ctrl+I — Italic",
+                        "Ctrl+1–6 — Heading level",
+                        "Ctrl+E — Inline code",
+                        "Ctrl+Shift+E — Code block",
+                    ]
+                    .into_iter()
+                    .map(|shortcut| div().font_family(theme.ui_font).text_sm().child(shortcut)),
+                ),
             );
         sheet(theme).items_center().child(column).into_any_element()
     }
