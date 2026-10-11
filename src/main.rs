@@ -2,6 +2,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod backlinks;
 mod completion;
 mod editor;
 mod formatting;
@@ -23,6 +24,10 @@ use std::{
     io,
     ops::Range,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -146,6 +151,8 @@ struct Wevren {
     navigation_index: Option<usize>,
     tabs: Vec<Tab>,
     content_search: Option<Task<anyhow::Result<()>>>,
+    backlinks: backlinks::Panel,
+    backlinks_task: Option<Task<anyhow::Result<()>>>,
     move_picker: bool,
     layout: PaneLayout,
     last_session: Option<session::Session>,
@@ -190,6 +197,8 @@ impl Wevren {
             navigation_index: None,
             tabs: Vec::new(),
             content_search: None,
+            backlinks: backlinks::Panel::default(),
+            backlinks_task: None,
             move_picker: false,
             layout: PaneLayout::default(),
             last_session: None,
@@ -215,6 +224,7 @@ impl Wevren {
         cx.subscribe_in(&editor, window, |this, source, _: &Edited, window, cx| {
             this.select_editor(source, window, cx);
             this.schedule_save(cx);
+            this.refresh_backlinks(cx);
             this.refresh_find(false, cx);
             cx.notify();
         })
@@ -625,6 +635,9 @@ impl Wevren {
                         }
                     }
                     this.store_active_tab();
+                    if !this.backlinks.busy && !this.settings_open && !this.focus_mode {
+                        this.refresh_backlinks(cx);
+                    }
                 })?;
             }
         }));
@@ -834,6 +847,92 @@ impl Wevren {
                 }
             })
         }));
+        cx.notify();
+    }
+
+    fn refresh_backlinks(&mut self, cx: &mut Context<Self>) {
+        if let Some(cancelled) = self.backlinks.cancellation.take() {
+            cancelled.store(true, Ordering::Relaxed);
+        }
+        self.backlinks_task.take();
+        self.backlinks.generation = self.backlinks.generation.wrapping_add(1);
+        let changed =
+            self.backlinks.target != self.open || self.backlinks.root != self.settings.folder;
+        self.backlinks.target.clone_from(&self.open);
+        self.backlinks.root.clone_from(&self.settings.folder);
+        if changed {
+            self.backlinks.results = backlinks::Results::default();
+            self.backlinks.loaded = false;
+        }
+        self.backlinks.busy = false;
+        let (Some(root), Some(target)) = (self.settings.folder.clone(), self.open.clone()) else {
+            return;
+        };
+        self.store_active_tab();
+        let open: Vec<_> = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.dirty || tab.conflict.is_some())
+            .map(|tab| (tab.path.clone(), tab.editor.read(cx).text().to_owned()))
+            .collect();
+        let paths = self.notes.clone();
+        let generation = self.backlinks.generation;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.backlinks.cancellation = Some(cancelled.clone());
+        self.backlinks.busy = true;
+        self.backlinks_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(200))
+                .await;
+            let scan_root = root.clone();
+            let scan_target = target.clone();
+            let results = cx
+                .background_executor()
+                .spawn(async move {
+                    backlinks::find(&scan_root, &scan_target, &paths, &open, &cancelled)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.backlinks.accepts(&root, &target, generation)
+                    && this.settings.folder.as_ref() == Some(&root)
+                    && this.open.as_ref() == Some(&target)
+                {
+                    this.backlinks.results = results;
+                    this.backlinks.loaded = true;
+                    this.backlinks.busy = false;
+                    this.backlinks.cancellation = None;
+                    cx.notify();
+                }
+            })
+        }));
+        cx.notify();
+    }
+
+    fn open_backlink(
+        &mut self,
+        target: &Path,
+        hit: &backlinks::Hit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.open.as_deref() != Some(target) {
+            return;
+        }
+        let Some(root) = self.settings.folder.clone() else {
+            return;
+        };
+        if !self.open_note_with_history(hit.path.clone(), true, window, cx) {
+            return;
+        }
+        if let Some(range) =
+            backlinks::locate(&root, target, &self.notes, hit, self.editor.read(cx).text())
+        {
+            self.editor
+                .update(cx, |editor, cx| editor.select_range(range, cx));
+            self.editor.focus_handle(cx).focus(window);
+        } else {
+            self.error = Some("The backlink changed. The source note is open, but its original link could not be located safely.".into());
+        }
         cx.notify();
     }
 
@@ -2253,8 +2352,99 @@ impl Wevren {
             .w(px(SIDEBAR_WIDTH))
             .child(list)
             .when(!self.settings_open, |sidebar| {
-                sidebar.children(self.outline_panel(theme, cx))
+                sidebar
+                    .children(self.outline_panel(theme, cx))
+                    .children(self.backlinks_panel(theme, cx))
             })
+    }
+
+    fn backlinks_panel(&self, theme: Theme, cx: &mut Context<Self>) -> Option<Div> {
+        let target = self.open.as_ref()?;
+        let root = self.settings.folder.as_ref()?;
+        let results = &self.backlinks.results;
+        let rows = results.hits.iter().enumerate().map(|(index, hit)| {
+            let hit = hit.clone();
+            let target = target.clone();
+            let title = notes::title(&hit.path);
+            let folder = hit
+                .path
+                .parent()
+                .and_then(|parent| parent.strip_prefix(root).ok())
+                .map(|path| path.to_string_lossy().replace('\\', "/"))
+                .filter(|path| !path.is_empty())
+                .unwrap_or_else(|| "Workspace root".to_owned());
+            div()
+                .id(("backlink", index))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .px_2()
+                .py_2()
+                .rounded_md()
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.hover).text_color(theme.text))
+                .child(div().truncate().text_color(theme.text).child(title))
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(10.))
+                        .text_color(theme.faint)
+                        .child(format!("{folder} · line {}", hit.line)),
+                )
+                .child(div().text_size(px(11.)).child(hit.snippet.clone()))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_backlink(&target, &hit, window, cx)
+                }))
+        });
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .flex_none()
+                .gap_1()
+                .border_t_1()
+                .border_color(theme.line)
+                .mt_2()
+                .pt_3()
+                .pb_2()
+                .child(label("BACKLINKS", theme).px_3())
+                .child(
+                    div()
+                        .px_3()
+                        .text_size(px(11.))
+                        .text_color(theme.faint)
+                        .truncate()
+                        .child(notes::link_title(target, root)),
+                )
+                .child(
+                    div()
+                        .id("note-backlinks")
+                        .mx_1()
+                        .max_h(px(180.))
+                        .overflow_y_scroll()
+                        .text_size(px(12.))
+                        .text_color(theme.muted)
+                        .when(self.backlinks.busy && !self.backlinks.loaded, |list| {
+                            list.child(div().px_2().py_1().child("Loading backlinks…"))
+                        })
+                        .when(self.backlinks.loaded && results.hits.is_empty(), |list| {
+                            list.child(div().px_2().py_1().child("No links from other notes"))
+                        })
+                        .children(rows)
+                        .when(results.limited, |list| {
+                            list.child(div().px_2().py_1().child("First 200 links shown"))
+                        })
+                        .when(results.skipped > 0, |list| {
+                            list.child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .text_color(theme.danger)
+                                    .child(format!("{} unreadable notes skipped", results.skipped)),
+                            )
+                        }),
+                ),
+        )
     }
 
     fn outline_panel(&self, theme: Theme, cx: &mut Context<Self>) -> Option<Div> {
@@ -3384,6 +3574,9 @@ impl Render for DraggedNote {
 impl Render for Wevren {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.store_active_tab();
+        if self.backlinks.target != self.open || self.backlinks.root != self.settings.folder {
+            self.refresh_backlinks(cx);
+        }
         let theme = *cx.global::<Theme>();
         let has_folder = self.settings.folder.is_some();
         let page = if self.settings_open || !has_folder {

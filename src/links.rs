@@ -1,9 +1,101 @@
 use std::{
     io,
+    ops::Range,
     path::{Path, PathBuf},
 };
 
 use crate::{markdown, notes};
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct WikiLink {
+    pub range: Range<usize>,
+    pub target: Range<usize>,
+    pub line: usize,
+    pub context: Range<usize>,
+}
+
+pub fn wiki_links(text: &str) -> Vec<WikiLink> {
+    let mut links = Vec::new();
+    let mut offset = 0;
+    let mut skip_until = 0;
+    let mut lines: Vec<_> = text
+        .split_inclusive('\n')
+        .zip(markdown::styles(text))
+        .map(|(line, style)| {
+            let start = offset;
+            offset += line.len();
+            (start, line, style, text.len())
+        })
+        .collect();
+    let mut block_end = text.len();
+    for (start, line, style, span_end) in lines.iter_mut().rev() {
+        if style.code || style.heading.is_some() || line.trim().is_empty() {
+            *span_end = *start + line.len();
+            block_end = *start;
+        } else {
+            *span_end = block_end;
+        }
+    }
+    for (number, (start, line, style, span_end)) in lines.into_iter().enumerate() {
+        offset = start + line.len();
+        if style.code {
+            continue;
+        }
+        let mut index = start.max(skip_until);
+        while index < offset {
+            let rest = &text[index..offset];
+            if rest.starts_with('\\') {
+                index += 1;
+                if let Some(next) = text[index..offset].chars().next() {
+                    index += next.len_utf8();
+                }
+            } else if rest.starts_with('`') {
+                let count = rest.bytes().take_while(|&byte| byte == b'`').count();
+                index += count;
+                if let Some(close) = code_end(&text[index..span_end], count) {
+                    index += close;
+                    skip_until = index;
+                }
+            } else if rest.starts_with("[[")
+                && let Some(close) = link_end(rest)
+                && !rest[2..close].contains(['[', '\n', '\r'])
+            {
+                let target = rest[2..close].split(['|', '#']).next().unwrap_or_default();
+                let trimmed = target.trim();
+                let target_start = index + 2 + target.len() - target.trim_start().len();
+                links.push(WikiLink {
+                    range: index..index + close + 2,
+                    target: target_start..target_start + trimmed.len(),
+                    line: number + 1,
+                    context: start..offset,
+                });
+                index += close + 2;
+            } else {
+                index += rest.chars().next().map_or(1, char::len_utf8);
+            }
+        }
+    }
+    links
+}
+
+fn link_end(text: &str) -> Option<usize> {
+    let mut offset = 2;
+    while let Some(close) = text[offset..].find("]]") {
+        let close = offset + close;
+        let escaped = text[..close]
+            .bytes()
+            .rev()
+            .take_while(|&byte| byte == b'\\')
+            .count()
+            % 2
+            == 1;
+        if !escaped {
+            return Some(close);
+        }
+        offset = close + 2;
+    }
+    None
+}
 
 struct Update {
     path: PathBuf,
@@ -54,57 +146,15 @@ impl Relocation<'_> {
 
     fn rewrite(&self, source: &Path, text: &str) -> String {
         let mut result = String::with_capacity(text.len());
-        for (line, style) in text.split_inclusive('\n').zip(markdown::styles(text)) {
-            if style.code {
-                result.push_str(line);
-            } else {
-                result.push_str(&self.rewrite_line(source, line));
-            }
-        }
-        result
-    }
-
-    fn rewrite_line(&self, source: &Path, line: &str) -> String {
-        let mut result = String::new();
         let mut copied = 0;
-        let mut index = 0;
-        while index < line.len() {
-            let rest = &line[index..];
-            if rest.starts_with('\\') {
-                index += 1;
-                if let Some(next) = line[index..].chars().next() {
-                    index += next.len_utf8();
-                }
-                continue;
-            }
-            if rest.starts_with('`') {
-                let count = rest.bytes().take_while(|&byte| byte == b'`').count();
-                index += count;
-                if let Some(close) = code_end(&line[index..], count) {
-                    index += close;
-                }
-                continue;
-            }
-            if rest.starts_with("[[")
-                && let Some(close) = rest.find("]]")
-                && !rest[2..close].contains(['[', '\n'])
-            {
-                let body = &rest[2..close];
-                let target = body.split(['|', '#']).next().unwrap_or_default();
-                let trimmed = target.trim();
-                if let Some(replacement) = self.target(source, trimmed) {
-                    let start = index + 2 + target.len() - target.trim_start().len();
-                    let end = start + trimmed.len();
-                    result.push_str(&line[copied..start]);
-                    result.push_str(&replacement);
-                    copied = end;
-                }
-                index += close + 2;
-            } else {
-                index += rest.chars().next().map_or(1, char::len_utf8);
+        for link in wiki_links(text) {
+            if let Some(replacement) = self.target(source, &text[link.target.clone()]) {
+                result.push_str(&text[copied..link.target.start]);
+                result.push_str(&replacement);
+                copied = link.target.end;
             }
         }
-        result.push_str(&line[copied..]);
+        result.push_str(&text[copied..]);
         result
     }
 }
@@ -271,4 +321,81 @@ fn rollback(updates: &[Update], renamed: &Path, old: &Path, error: &io::Error) -
             failures.join(", ")
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wiki_links_exclude_code_and_escapes_and_preserve_utf8_crlf_ranges() {
+        let text = "é [[ Target#heading|alias ]]\r\n\\[[escaped]] \\é [[visible]]\r\n`[[inline]]` ``[[inline too]]``\r\n~~~rust\r\n[[fenced]]\r\n~~~\r\n    [[indented]]\r\n\t[[tab]]\r\n`multiline\r\n[[hidden]]` [[last]]\r\n";
+        let links = wiki_links(text);
+        assert_eq!(
+            links
+                .iter()
+                .map(|link| &text[link.target.clone()])
+                .collect::<Vec<_>>(),
+            vec!["Target", "visible", "last"]
+        );
+        assert_eq!(links[0].range, 3..29);
+        assert_eq!(links[0].line, 1);
+        assert_eq!(&text[links[0].range.clone()], "[[ Target#heading|alias ]]");
+        assert_eq!(links[2].line, 10);
+    }
+
+    #[test]
+    fn unmatched_backticks_do_not_hide_links_across_paragraph_or_code_boundaries() {
+        let text = "literal ` tick\n\n[[Target]] later ` tick\n\nmore ` text\n~~~rust\n` [[hidden]]\n~~~\n[[visible]]\n\nlast ` literal\n    ` [[indented]]\n[[after indent]]\n";
+        assert_eq!(
+            wiki_links(text)
+                .iter()
+                .map(|link| &text[link.target.clone()])
+                .collect::<Vec<_>>(),
+            vec!["Target", "visible", "after indent"]
+        );
+        assert_eq!(
+            wiki_links("`same\n[[hidden]]` [[visible]]")
+                .iter()
+                .map(|link| &"`same\n[[hidden]]` [[visible]]"[link.target.clone()])
+                .collect::<Vec<_>>(),
+            vec!["visible"]
+        );
+    }
+
+    #[test]
+    fn escaped_opening_and_closing_markers_are_not_links() {
+        let text = "\\[[Target]] [[Target|label\\]]\n\\\\[[Target]] [[Target|label\\\\]]";
+        assert_eq!(
+            wiki_links(text)
+                .iter()
+                .map(|link| &text[link.range.clone()])
+                .collect::<Vec<_>>(),
+            vec!["[[Target]]", "[[Target|label\\\\]]"]
+        );
+    }
+
+    #[test]
+    fn relocation_uses_the_same_link_parser_and_preserves_aliases_fragments() {
+        let root = Path::new("workspace");
+        let old = root.join("Target.md");
+        let new = root.join("Renamed.md");
+        let source = root.join("Source.md");
+        let before = vec![old.clone(), source.clone()];
+        let after = vec![new.clone(), source.clone()];
+        let relocation = Relocation {
+            root,
+            old: &old,
+            new: &new,
+            before: &before,
+            after: &after,
+        };
+        assert_eq!(
+            relocation.rewrite(
+                &source,
+                "[[ Target#h|label ]] `[[Target]]`\n    [[Target]]\n\\[[Target]]"
+            ),
+            "[[ Renamed#h|label ]] `[[Target]]`\n    [[Target]]\n\\[[Target]]"
+        );
+    }
 }
