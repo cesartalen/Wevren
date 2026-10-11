@@ -1247,7 +1247,7 @@ impl Wevren {
         let tabs = self.tabs.iter().enumerate().map(|(index, tab)| {
             let path = tab.path.clone();
             let close_path = path.clone();
-            let dragged = DraggedNote(path.clone());
+            let dragged = DraggedNote(path.clone(), gpui::Point::default());
             let active = self.open.as_ref() == Some(&path) && !self.settings_open;
             let title = notes::title(&path);
             let duplicate = self
@@ -1283,7 +1283,9 @@ impl Wevren {
                 .when(active, |tab| tab.bg(theme.sheet))
                 .hover(|tab| tab.bg(theme.hover))
                 .child(div().min_w_0().truncate().child(title))
-                .on_drag(dragged, |note, _, _, cx| cx.new(|_| note.clone()))
+                .on_drag(dragged, |note, offset, _, cx| {
+                    cx.new(|_| DraggedNote(note.0.clone(), offset))
+                })
                 .child(
                     div()
                         .id(("close-tab", index))
@@ -2236,9 +2238,10 @@ impl Wevren {
                 row.drag_over::<DraggedNote>(move |style, _, _, _| style.bg(theme.hover))
             })
             .when(!directory, |row| {
-                row.on_drag(DraggedNote(path.clone()), |note, _, _, cx| {
-                    cx.new(|_| note.clone())
-                })
+                row.on_drag(
+                    DraggedNote(path.clone(), gpui::Point::default()),
+                    |note, offset, _, cx| cx.new(|_| DraggedNote(note.0.clone(), offset)),
+                )
             })
             .on_drop(cx.listener(move |this, note: &DraggedNote, window, cx| {
                 if let Some(folder) = &folder {
@@ -2747,21 +2750,72 @@ fn empty_page(theme: Theme) -> AnyElement {
 
 /// Note dragged from the note list, shown under the pointer by its title.
 #[derive(Clone)]
-struct DraggedNote(PathBuf);
+struct DraggedNote(PathBuf, gpui::Point<gpui::Pixels>);
 
 impl Render for DraggedNote {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
-        div()
-            .px_3()
-            .py_1()
-            .rounded_md()
-            .border_1()
-            .border_color(theme.line)
-            .bg(theme.sheet)
-            .font_family(theme.text_font)
-            .text_color(theme.text)
-            .child(notes::title(&self.0))
+        let folder = self
+            .0
+            .parent()
+            .and_then(Path::file_name)
+            .map(|name| name.to_string_lossy().into_owned());
+        div().pl(self.1.x + px(10.)).pt(self.1.y + px(10.)).child(
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .max_w(px(260.))
+                .px_3()
+                .py(px(10.))
+                .rounded(px(12.))
+                .border_1()
+                .border_color(theme.line)
+                .bg(theme.sheet)
+                .shadow_md()
+                .font_family(theme.ui_font)
+                .text_size(px(14.))
+                .line_height(px(20.))
+                .text_color(theme.text)
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .size_8()
+                        .rounded_md()
+                        .bg(Rgba {
+                            a: 0.1,
+                            ..theme.accent
+                        })
+                        .font_family(ICON_FONT)
+                        .text_size(px(16.))
+                        .text_color(theme.accent)
+                        .child("\u{e8a5}"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .truncate()
+                                .font_family(theme.text_font)
+                                .child(notes::title(&self.0)),
+                        )
+                        .children(folder.map(|folder| {
+                            div()
+                                .truncate()
+                                .text_size(px(11.))
+                                .line_height(px(16.))
+                                .text_color(theme.muted)
+                                .child(folder)
+                        })),
+                ),
+        )
     }
 }
 
