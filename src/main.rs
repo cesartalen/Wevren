@@ -1731,6 +1731,9 @@ impl Wevren {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.settings.relocate_pin(old, &path) {
+            self.report(self.settings.save());
+        }
         for visited in &mut self.navigation {
             if *visited == old {
                 visited.clone_from(&path);
@@ -1993,6 +1996,23 @@ impl Wevren {
         cx.notify();
     }
 
+    fn toggle_pin(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if !self.notes.iter().any(|note| note == path) || !path.is_file() {
+            self.error = Some("Cannot pin a note that is no longer in the workspace".into());
+        } else {
+            let mut settings = self.settings.clone();
+            settings.set_pinned(path.to_path_buf(), !settings.pinned_notes.contains(path));
+            match settings.save() {
+                Ok(()) => {
+                    self.settings = settings;
+                    self.error = None;
+                }
+                Err(error) => self.error = Some(format!("Could not save pins: {error}").into()),
+            }
+        }
+        cx.notify();
+    }
+
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(action) = self.shortcut_capture {
             if !self.settings_open && self.settings.folder.is_some() {
@@ -2086,7 +2106,7 @@ impl Wevren {
             }
         });
         let root = self.settings.folder.as_deref();
-        let rows = self
+        let rows: Vec<_> = self
             .entries
             .iter()
             .filter(|entry| {
@@ -2097,7 +2117,39 @@ impl Wevren {
                     .take_while(|parent| Some(*parent) != root)
                     .all(|parent| self.expanded.contains(parent))
             })
-            .map(|entry| self.sidebar_row(entry, theme, cx));
+            .map(|entry| self.sidebar_row(entry, false, theme, cx))
+            .collect();
+        let pinned = root.map_or_else(Vec::new, |root| {
+            self.settings.visible_pins(root, &self.notes)
+        });
+        let pins_empty = pinned.is_empty();
+        let pinned_rows = pinned.into_iter().map(|path| {
+            self.sidebar_row(
+                &notes::Entry {
+                    path: path.clone(),
+                    directory: false,
+                },
+                true,
+                theme,
+                cx,
+            )
+        });
+        let pins = div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .pb_3()
+            .child(label("PINNED", theme).px_3().pb_2())
+            .when(pins_empty, |list| {
+                list.child(
+                    div()
+                        .px_3()
+                        .text_size(px(12.))
+                        .text_color(theme.faint)
+                        .child("No pinned notes"),
+                )
+            })
+            .children(pinned_rows);
         let folder_input = self.folder_input.as_ref().map(|input| {
             div()
                 .px_3()
@@ -2131,6 +2183,7 @@ impl Wevren {
             .pt_3()
             .overflow_y_scroll()
             .on_drop(drop_root)
+            .child(pins)
             .child(header)
             .children(folder_input)
             .when(self.entries.is_empty(), |list| list.child(empty))
@@ -2281,6 +2334,7 @@ impl Wevren {
     fn sidebar_row(
         &self,
         entry: &notes::Entry,
+        pinned: bool,
         theme: Theme,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
@@ -2292,12 +2346,16 @@ impl Wevren {
             self.open.as_ref() == Some(&entry.path)
         };
         let expanded = self.expanded.contains(&entry.path);
-        let indent = entry
-            .path
-            .strip_prefix(root.unwrap_or(Path::new("")))
-            .map_or(0., |path| {
-                path.components().skip(1).fold(0., |indent, _| indent + 14.)
-            });
+        let indent = if pinned {
+            0.
+        } else {
+            entry
+                .path
+                .strip_prefix(root.unwrap_or(Path::new("")))
+                .map_or(0., |path| {
+                    path.components().skip(1).fold(0., |indent, _| indent + 14.)
+                })
+        };
         let name = if directory {
             entry
                 .path
@@ -2305,6 +2363,8 @@ impl Wevren {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned()
+        } else if pinned {
+            notes::link_title(&entry.path, root.unwrap_or(Path::new("")))
         } else {
             notes::title(&entry.path)
         };
@@ -2328,7 +2388,11 @@ impl Wevren {
             knot(active, theme)
         };
         div()
-            .id(SharedString::from(path.to_string_lossy().into_owned()))
+            .id(SharedString::from(if pinned {
+                format!("pinned:{}", path.display())
+            } else {
+                path.to_string_lossy().into_owned()
+            }))
             .flex()
             .flex_none()
             .items_center()
@@ -2447,11 +2511,37 @@ impl Wevren {
     ) -> AnyElement {
         let active = pane == self.layout.active;
         let title = self.note_title(path, pane, theme, cx);
+        let pinned = self.settings.pinned_notes.contains(path);
+        let pin_path = path.to_path_buf();
+        let header = div()
+            .flex()
+            .items_start()
+            .gap_3()
+            .child(div().flex_1().min_w_0().child(title))
+            .child(
+                div()
+                    .id(("pin-note", pane))
+                    .flex_none()
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .font_family(theme.ui_font)
+                    .text_size(px(13.))
+                    .text_color(if pinned { theme.accent } else { theme.muted })
+                    .border_1()
+                    .border_color(theme.line)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme.hover).text_color(theme.text))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_pin(&pin_path, cx);
+                    }))
+                    .child(if pinned { "Unpin" } else { "Pin" }),
+            );
         let column = column()
             .min_h_full()
             .pb_8()
             .line_height(relative(1.7))
-            .child(title)
+            .child(header)
             .child(rule(theme))
             .child(editor.clone());
         let scroll = div()

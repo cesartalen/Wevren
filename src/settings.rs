@@ -1,6 +1,10 @@
 //! Settings persisted between sessions.
 
-use std::{fs, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
@@ -17,6 +21,8 @@ pub struct Settings {
     pub folder: Option<PathBuf>,
     #[serde(default)]
     pub shortcuts: Bindings,
+    #[serde(default)]
+    pub pinned_notes: BTreeSet<PathBuf>,
 }
 
 impl Settings {
@@ -37,8 +43,38 @@ impl Settings {
     pub fn save(&self) -> Result<()> {
         let dir = dir().context("there is no configuration folder")?;
         fs::create_dir_all(&dir)?;
-        fs::write(dir.join(FILE), serde_json::to_string_pretty(self)?)?;
+        self.save_to(&dir.join(FILE))
+    }
+
+    fn save_to(&self, path: &Path) -> Result<()> {
+        fs::write(path, serde_json::to_string_pretty(self)?)?;
         Ok(())
+    }
+
+    pub fn set_pinned(&mut self, path: PathBuf, pinned: bool) {
+        if pinned {
+            self.pinned_notes.insert(path);
+        } else {
+            self.pinned_notes.remove(&path);
+        }
+    }
+
+    pub fn relocate_pin(&mut self, old: &Path, new: &Path) -> bool {
+        if old != new && self.pinned_notes.remove(old) {
+            self.pinned_notes.insert(new.to_path_buf());
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn visible_pins<'a>(&self, root: &Path, notes: &'a [PathBuf]) -> Vec<&'a PathBuf> {
+        notes
+            .iter()
+            .filter(|path| {
+                path.starts_with(root) && self.pinned_notes.contains(*path) && path.is_file()
+            })
+            .collect()
     }
 }
 
@@ -49,8 +85,114 @@ pub(crate) fn dir() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use super::Settings;
     use crate::shortcuts::{Action, Bindings, Chord};
+
+    struct TestFolder(PathBuf);
+
+    impl TestFolder {
+        fn new() -> Self {
+            let folder = std::env::temp_dir().join(format!(
+                "wevren-pins-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir(&folder).unwrap();
+            Self(folder)
+        }
+    }
+
+    impl Drop for TestFolder {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn pins_are_explicit_idempotent_and_persist_without_changing_other_settings() {
+        let folder = TestFolder::new();
+        let first = folder.0.join("First.md");
+        let second = folder.0.join("Second.md");
+        let mut settings = Settings {
+            folder: Some(folder.0.clone()),
+            shortcuts: Bindings::default()
+                .changed(Action::Bold, Chord::try_from("Ctrl+J".to_owned()).unwrap())
+                .unwrap(),
+            ..Settings::default()
+        };
+        settings.set_pinned(first.clone(), true);
+        settings.set_pinned(first.clone(), true);
+        settings.set_pinned(second.clone(), true);
+        settings.set_pinned(second.clone(), false);
+        settings.set_pinned(second, false);
+        assert_eq!(settings.pinned_notes, [first.clone()].into());
+        let file = folder.0.join("settings.json");
+        settings.save_to(&file).unwrap();
+        let mut restored: Settings =
+            serde_json::from_str(&fs::read_to_string(file).unwrap()).unwrap();
+        assert_eq!(restored, settings);
+        restored.shortcuts = Bindings::default();
+        assert_eq!(restored.folder, settings.folder);
+        assert_eq!(restored.pinned_notes, [first].into());
+        assert!(settings.save_to(&folder.0).is_err());
+        let legacy: Settings = serde_json::from_str(r#"{"folder":"notes"}"#).unwrap();
+        assert!(legacy.pinned_notes.is_empty());
+    }
+
+    #[test]
+    fn visible_pins_follow_workspace_scan_and_hide_missing_files() {
+        let folder = TestFolder::new();
+        let root = folder.0.join("workspace");
+        let nested = root.join("collapsed");
+        fs::create_dir_all(&nested).unwrap();
+        let pinned = nested.join("Same.md");
+        let unpinned = root.join("Same.md");
+        let other = folder.0.join("Other.md");
+        let missing = root.join("Missing.md");
+        for path in [&pinned, &unpinned, &other] {
+            fs::write(path, "").unwrap();
+        }
+        let mut settings = Settings::default();
+        for path in [&pinned, &other, &missing, &nested] {
+            settings.set_pinned(path.clone(), true);
+        }
+        let notes = vec![pinned.clone(), unpinned, other.clone(), missing, nested];
+        assert_eq!(settings.visible_pins(&root, &notes), vec![&pinned]);
+        settings.folder = Some(folder.0.clone());
+        assert_eq!(
+            settings.visible_pins(&folder.0, &notes),
+            vec![&pinned, &other]
+        );
+        assert!(settings.visible_pins(&root, &[]).is_empty());
+        fs::remove_file(&pinned).unwrap();
+        assert!(settings.visible_pins(&root, &notes).is_empty());
+        assert!(settings.pinned_notes.contains(&other));
+    }
+
+    #[test]
+    fn relocated_pins_follow_rename_and_move_and_deduplicate() {
+        let old = PathBuf::from("workspace/Old.md");
+        let renamed = PathBuf::from("workspace/New.md");
+        let moved = PathBuf::from("workspace/sub/New.md");
+        let mut settings = Settings::default();
+        assert!(!settings.relocate_pin(&old, &renamed));
+        settings.set_pinned(old.clone(), true);
+        assert!(!settings.relocate_pin(&old, &old));
+        assert!(settings.relocate_pin(&old, &renamed));
+        settings.set_pinned(moved.clone(), true);
+        assert!(settings.relocate_pin(&renamed, &moved));
+        assert_eq!(settings.pinned_notes, [moved].into());
+        assert!(!settings.relocate_pin(&old, &renamed));
+    }
 
     #[test]
     fn shortcut_settings_round_trip_and_restore_preserve_folder() {
@@ -59,6 +201,7 @@ mod tests {
             shortcuts: Bindings::default()
                 .changed(Action::Bold, Chord::try_from("Ctrl+J".to_owned()).unwrap())
                 .unwrap(),
+            ..Settings::default()
         };
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains("Ctrl+J"));
