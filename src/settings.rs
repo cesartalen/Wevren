@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::shortcuts::Bindings;
 
@@ -23,6 +23,80 @@ pub struct Settings {
     pub shortcuts: Bindings,
     #[serde(default)]
     pub pinned_notes: BTreeSet<PathBuf>,
+    #[serde(default)]
+    pub typography: Typography,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditorFont {
+    #[default]
+    Sitka,
+    Georgia,
+    Segoe,
+    Consolas,
+}
+
+impl EditorFont {
+    pub const ALL: [Self; 4] = [Self::Sitka, Self::Georgia, Self::Segoe, Self::Consolas];
+
+    pub fn family(self) -> &'static str {
+        match self {
+            Self::Sitka => "Sitka Text",
+            Self::Georgia => "Georgia",
+            Self::Segoe => "Segoe UI",
+            Self::Consolas => "Consolas",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct Typography {
+    pub font: EditorFont,
+    pub font_size: u16,
+    pub line_spacing: u16,
+    pub text_width: u16,
+}
+
+impl Default for Typography {
+    fn default() -> Self {
+        Self {
+            font: EditorFont::default(),
+            font_size: 16,
+            line_spacing: 170,
+            text_width: 640,
+        }
+    }
+}
+
+impl Typography {
+    pub fn line_height(self) -> f32 {
+        f32::from(self.line_spacing) / 100.
+    }
+}
+
+impl<'de> Deserialize<'de> for Typography {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let defaults = Self::default();
+        let number = |key: &str, default: u16, min: u16, max: u16| {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_i64)
+                .map_or(default, |value| {
+                    value.clamp(i64::from(min), i64::from(max)) as u16
+                })
+        };
+        Ok(Self {
+            font: value
+                .get("font")
+                .and_then(|font| serde_json::from_value(font.clone()).ok())
+                .unwrap_or(defaults.font),
+            font_size: number("font_size", defaults.font_size, 12, 32),
+            line_spacing: number("line_spacing", defaults.line_spacing, 100, 240),
+            text_width: number("text_width", defaults.text_width, 360, 1000),
+        })
+    }
 }
 
 impl Settings {
@@ -91,7 +165,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::Settings;
+    use super::{EditorFont, Settings, Typography};
     use crate::shortcuts::{Action, Bindings, Chord};
 
     struct TestFolder(PathBuf);
@@ -115,6 +189,114 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn legacy_settings_use_original_editor_typography() {
+        let settings: Settings = serde_json::from_str(r#"{"folder":"notes"}"#).unwrap();
+        assert_eq!(settings.typography, Typography::default());
+        assert_eq!(settings.typography.font.family(), "Sitka Text");
+        assert_eq!(settings.typography.font_size, 16);
+        assert_eq!(settings.typography.line_height(), 1.7);
+        assert_eq!(settings.typography.text_width, 640);
+    }
+
+    #[test]
+    fn typography_persists_without_changing_workspace_shortcuts_or_pins() {
+        let folder = TestFolder::new();
+        let mut settings = Settings {
+            folder: Some(folder.0.clone()),
+            shortcuts: Bindings::default()
+                .changed(Action::Bold, Chord::try_from("Ctrl+J".to_owned()).unwrap())
+                .unwrap(),
+            pinned_notes: [folder.0.join("Pinned.md")].into(),
+            ..Settings::default()
+        };
+        for font in EditorFont::ALL {
+            settings.typography = Typography {
+                font,
+                font_size: 24,
+                line_spacing: 210,
+                text_width: 920,
+            };
+            let file = folder.0.join("settings.json");
+            settings.save_to(&file).unwrap();
+            let restored: Settings =
+                serde_json::from_str(&fs::read_to_string(file).unwrap()).unwrap();
+            assert_eq!(restored, settings);
+            assert_eq!(restored.typography.line_height(), 2.1);
+        }
+    }
+
+    #[test]
+    fn malformed_typography_fields_are_repaired_independently() {
+        for typography in ["null", "42", "[]", r#""invalid""#, "{}"] {
+            let settings: Settings = serde_json::from_str(&format!(
+                r#"{{"folder":"notes","shortcuts":{{"bold":"Ctrl+J"}},"pinned_notes":["Pinned.md"],"typography":{typography}}}"#,
+            )).unwrap();
+            assert_eq!(settings.folder, Some("notes".into()));
+            assert_eq!(settings.shortcuts.chord(Action::Bold).to_string(), "Ctrl+J");
+            assert_eq!(settings.pinned_notes, [PathBuf::from("Pinned.md")].into());
+            assert_eq!(settings.typography, Typography::default());
+        }
+        let typography: Typography = serde_json::from_str(
+            r#"{"font":"unknown","font_size":"large","line_spacing":200,"text_width":800}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            typography,
+            Typography {
+                line_spacing: 200,
+                text_width: 800,
+                ..Typography::default()
+            }
+        );
+        let typography: Typography = serde_json::from_str(
+            r#"{"font":"georgia","font_size":20,"line_spacing":null,"text_width":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            typography,
+            Typography {
+                font: EditorFont::Georgia,
+                font_size: 20,
+                ..Typography::default()
+            }
+        );
+        let typography: Typography =
+            serde_json::from_str(r#"{"font_size":16.5,"line_spacing":{},"text_width":[]}"#)
+                .unwrap();
+        assert_eq!(typography, Typography::default());
+    }
+
+    #[test]
+    fn typography_bounds_and_font_families_match_style_values() {
+        let low: Typography =
+            serde_json::from_str(r#"{"font_size":-10,"line_spacing":0,"text_width":100}"#).unwrap();
+        assert_eq!(
+            (low.font_size, low.line_spacing, low.text_width),
+            (12, 100, 360)
+        );
+        assert_eq!(low.line_height(), 1.);
+        let high: Typography =
+            serde_json::from_str(r#"{"font_size":400,"line_spacing":999,"text_width":5000}"#)
+                .unwrap();
+        assert_eq!(
+            (high.font_size, high.line_spacing, high.text_width),
+            (32, 240, 1000)
+        );
+        assert_eq!(high.line_height(), 2.4);
+        for typography in [low, high] {
+            assert_eq!(
+                serde_json::from_str::<Typography>(&serde_json::to_string(&typography).unwrap())
+                    .unwrap(),
+                typography
+            );
+        }
+        assert_eq!(
+            EditorFont::ALL.map(EditorFont::family),
+            ["Sitka Text", "Georgia", "Segoe UI", "Consolas"]
+        );
     }
 
     #[test]

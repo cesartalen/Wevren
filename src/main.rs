@@ -33,7 +33,7 @@ use gpui::{
     WindowBounds, WindowControlArea, WindowOptions, div, prelude::*, px, relative, size,
 };
 use mimalloc::MiMalloc;
-use settings::Settings;
+use settings::{EditorFont, Settings, Typography};
 use shortcuts::{Action, Bindings, Chord};
 use theme::Theme;
 
@@ -2013,6 +2013,19 @@ impl Wevren {
         cx.notify();
     }
 
+    fn save_typography(&mut self, typography: Typography, cx: &mut Context<Self>) {
+        let mut settings = self.settings.clone();
+        settings.typography = typography;
+        match settings.save() {
+            Ok(()) => {
+                self.settings = settings;
+                self.error = None;
+            }
+            Err(error) => self.error = Some(format!("Could not save typography: {error}").into()),
+        }
+        cx.notify();
+    }
+
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(action) = self.shortcut_capture {
             if !self.settings_open && self.settings.folder.is_some() {
@@ -2538,12 +2551,22 @@ impl Wevren {
                     .child(if pinned { "Unpin" } else { "Pin" }),
             );
         let column = column()
+            .max_w(px(f32::from(self.settings.typography.text_width)))
             .min_h_full()
             .pb_8()
-            .line_height(relative(1.7))
             .child(header)
             .child(rule(theme))
-            .child(editor.clone());
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_grow()
+                    .w_full()
+                    .font_family(self.settings.typography.font.family())
+                    .text_size(px(f32::from(self.settings.typography.font_size)))
+                    .line_height(relative(self.settings.typography.line_height()))
+                    .child(editor.clone()),
+            );
         let scroll = div()
             .id(("note", pane))
             .flex()
@@ -2724,6 +2747,32 @@ impl Wevren {
                     .child(action),
             )
             .child(rule(theme))
+            .child(label("EDITOR TYPOGRAPHY", theme))
+            .child(
+                div().font_family(theme.ui_font).text_sm().text_color(theme.muted)
+                    .child("Changes save immediately and apply to every note. Text width includes page padding and adapts to the pane."),
+            )
+            .child(
+                div().font_family(theme.ui_font).text_sm().child("Font"),
+            )
+            .child(
+                div().flex().flex_wrap().gap_2().children(EditorFont::ALL.into_iter().enumerate().map(|(index, font)| {
+                    let selected = self.settings.typography.font == font;
+                    div().id(("editor-font", index)).px_3().py_1p5().rounded_md()
+                        .border_1().border_color(if selected { theme.accent } else { theme.line })
+                        .font_family(theme.ui_font).text_sm()
+                        .text_color(if selected { theme.accent } else { theme.text })
+                        .cursor_pointer().hover(|style| style.bg(theme.hover))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let mut typography = this.settings.typography;
+                            typography.font = font;
+                            this.save_typography(typography, cx);
+                        }))
+                        .child(font.family())
+                })),
+            )
+            .children(self.typography_rows(theme, cx))
+            .child(rule(theme))
             .child(label("KEYBOARD SHORTCUTS", theme))
             .child(
                 div().font_family(theme.ui_font).text_sm().text_color(theme.muted)
@@ -2755,6 +2804,87 @@ impl Wevren {
             .items_center()
             .child(column)
             .into_any_element()
+    }
+
+    fn typography_rows(&self, theme: Theme, cx: &mut Context<Self>) -> Vec<Div> {
+        let typography = self.settings.typography;
+        let fields = [
+            ("font-size", "Font size", typography.font_size, 12, 32, 1),
+            (
+                "line-spacing",
+                "Line spacing",
+                typography.line_spacing,
+                100,
+                240,
+                10,
+            ),
+            (
+                "text-width",
+                "Text width",
+                typography.text_width,
+                360,
+                1000,
+                40,
+            ),
+        ];
+        fields
+            .into_iter()
+            .map(|(id, label, value, min, max, step)| {
+                let display = if id == "line-spacing" {
+                    format!("{:.2}×", f32::from(value) / 100.)
+                } else {
+                    format!("{value} px")
+                };
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .w_full()
+                    .font_family(theme.ui_font)
+                    .text_sm()
+                    .child(label)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .children([false, true].map(|increase| {
+                                let enabled = if increase { value < max } else { value > min };
+                                div()
+                                    .id((id, usize::from(increase)))
+                                    .px_3()
+                                    .py_1p5()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(theme.line)
+                                    .text_color(if enabled { theme.text } else { theme.faint })
+                                    .when(enabled, |button| {
+                                        button.cursor_pointer().hover(|style| style.bg(theme.hover))
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if !enabled {
+                                            return;
+                                        }
+                                        let mut typography = this.settings.typography;
+                                        let value = match id {
+                                            "font-size" => &mut typography.font_size,
+                                            "line-spacing" => &mut typography.line_spacing,
+                                            _ => &mut typography.text_width,
+                                        };
+                                        *value = if increase {
+                                            value.saturating_add(step).min(max)
+                                        } else {
+                                            value.saturating_sub(step).max(min)
+                                        };
+                                        this.save_typography(typography, cx);
+                                    }))
+                                    .child(if increase { "+" } else { "−" })
+                            }))
+                            .child(div().min_w(px(72.)).child(display)),
+                    )
+            })
+            .collect()
     }
 
     fn shortcut_rows(
