@@ -18,17 +18,6 @@ pub struct Edit {
     pub selection: Range<usize>,
 }
 
-pub fn shortcut(key: &str, shift: bool) -> Option<Command> {
-    match (key, shift) {
-        ("b", false) => Some(Command::Bold),
-        ("i", false) => Some(Command::Italic),
-        ("1" | "2" | "3" | "4" | "5" | "6", false) => Some(Command::Heading(key.parse().ok()?)),
-        ("e", false) => Some(Command::InlineCode),
-        ("e", true) => Some(Command::FencedCode),
-        _ => None,
-    }
-}
-
 pub fn transform(text: &str, selection: Range<usize>, command: Command) -> Option<Edit> {
     if selection.start > selection.end
         || selection.end > text.len()
@@ -313,7 +302,7 @@ fn fenced_code(text: &str, selection: Range<usize>) -> Edit {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, shortcut, transform};
+    use super::{Command, transform};
     use std::ops::Range;
 
     fn apply(text: &str, selection: Range<usize>, command: Command) -> (String, Range<usize>) {
@@ -460,9 +449,5 @@ mod tests {
         assert!(transform("é", 0..3, Command::InlineCode).is_none());
         assert!(transform("é", 2..0, Command::Italic).is_none());
         assert!(transform("note", 0..4, Command::Heading(7)).is_none());
-        assert_eq!(shortcut("e", true), Some(Command::FencedCode));
-        assert_eq!(shortcut("6", false), Some(Command::Heading(6)));
-        assert_eq!(shortcut("b", true), None);
-        assert_eq!(shortcut("n", false), None);
     }
 }

@@ -15,6 +15,7 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use crate::{
     completion::{self, Completion},
     formatting, markdown,
+    shortcuts::Bindings,
     theme::Theme,
 };
 
@@ -673,22 +674,20 @@ impl Editor {
     /// Handles the keys that move the caret, delete, or use the clipboard.
     fn key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let Keystroke { modifiers, key, .. } = &event.keystroke;
-        if modifiers.alt && matches!(key.as_str(), "left" | "right") {
+        if let Some(action) = cx.global::<Bindings>().action(&event.keystroke) {
+            if !self.single_line
+                && self.marked.is_none()
+                && let Some(formatting) = action.formatting()
+            {
+                self.format(formatting, cx);
+                cx.stop_propagation();
+            }
             return;
         }
         let (caret, select) = (self.caret(), modifiers.shift);
         let step = select || self.selection.is_empty();
         // AltGr reports as control and alt together, and must keep typing characters.
         let command = modifiers.secondary() && !modifiers.alt;
-        if command
-            && !self.single_line
-            && self.marked.is_none()
-            && let Some(formatting) = formatting::shortcut(key, modifiers.shift)
-        {
-            self.format(formatting, cx);
-            cx.stop_propagation();
-            return;
-        }
         if command && key == "tab" {
             return;
         }

@@ -11,6 +11,7 @@ mod notes;
 mod search;
 mod session;
 mod settings;
+mod shortcuts;
 mod theme;
 mod window_controls;
 mod workspace_search;
@@ -33,6 +34,7 @@ use gpui::{
 };
 use mimalloc::MiMalloc;
 use settings::Settings;
+use shortcuts::{Action, Bindings, Chord};
 use theme::Theme;
 
 #[global_allocator]
@@ -105,6 +107,8 @@ struct Wevren {
     settings: Settings,
     /// Whether the settings page covers the open note.
     settings_open: bool,
+    shortcut_capture: Option<Action>,
+    shortcut_error: Option<String>,
     /// Why the last operation failed.
     error: Option<SharedString>,
     /// Every note in the notes folder, sorted by title.
@@ -137,6 +141,8 @@ struct Wevren {
 impl Wevren {
     /// Creates the view from the saved settings.
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let settings = Settings::load();
+        cx.set_global(settings.shortcuts.clone());
         let editor = Self::note_editor(window, cx);
         cx.on_release(|this, cx| {
             this.save_all(cx);
@@ -145,8 +151,10 @@ impl Wevren {
         .detach();
         let mut this = Self {
             focus: cx.focus_handle(),
-            settings: Settings::load(),
+            settings,
             settings_open: false,
+            shortcut_capture: None,
+            shortcut_error: None,
             error: None,
             notes: Vec::new(),
             entries: Vec::new(),
@@ -1970,8 +1978,50 @@ impl Wevren {
         cx.notify();
     }
 
-    /// Handles the platform's shortcuts for saving and for a new note.
+    fn save_shortcuts(&mut self, bindings: Bindings, cx: &mut Context<Self>) {
+        let mut settings = self.settings.clone();
+        settings.shortcuts = bindings;
+        match settings.save() {
+            Ok(()) => {
+                cx.set_global(settings.shortcuts.clone());
+                self.settings = settings;
+                self.shortcut_capture = None;
+                self.shortcut_error = None;
+            }
+            Err(error) => self.shortcut_error = Some(format!("Could not save shortcuts: {error}")),
+        }
+        cx.notify();
+    }
+
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(action) = self.shortcut_capture {
+            if !self.settings_open && self.settings.folder.is_some() {
+                self.shortcut_capture = None;
+            } else {
+                if matches!(
+                    event.keystroke.key.as_str(),
+                    "control" | "ctrl" | "alt" | "shift" | "cmd" | "super" | "win" | "fn"
+                ) {
+                    cx.stop_propagation();
+                    return;
+                }
+                if event.keystroke.key == "escape" {
+                    self.shortcut_capture = None;
+                    self.shortcut_error = None;
+                } else {
+                    match Chord::capture(&event.keystroke)
+                        .and_then(|chord| self.settings.shortcuts.changed(action, chord))
+                    {
+                        Ok(bindings) => self.save_shortcuts(bindings, cx),
+                        Err(error) => self.shortcut_error = Some(error),
+                    }
+                }
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
+        }
+        let action = self.settings.shortcuts.action(&event.keystroke);
         if self.move_picker {
             if event.keystroke.key == "escape" {
                 self.cancel_move(window, cx);
@@ -1979,57 +2029,43 @@ impl Wevren {
             cx.stop_propagation();
             return;
         }
-        if self.switcher.is_none()
-            && event.keystroke.modifiers.alt
-            && matches!(event.keystroke.key.as_str(), "left" | "right")
-        {
-            self.navigate(event.keystroke.key == "left", window, cx);
-            cx.stop_propagation();
-            return;
-        }
         if self.switcher.is_some() {
-            if event.keystroke.modifiers.secondary() && event.keystroke.key == "p" {
+            if action == Some(Action::Switcher) || action == Some(Action::WorkspaceSearch) {
                 self.close_switcher(window, cx);
             }
             cx.stop_propagation();
             return;
         }
-        if self.find.is_some() {
-            match event.keystroke.key.as_str() {
-                "escape" => self.close_find(window, cx),
-                "f3" => self.step_find(event.keystroke.modifiers.shift, cx),
-                _ => {}
-            }
-            if matches!(event.keystroke.key.as_str(), "escape" | "f3") {
-                cx.stop_propagation();
-                return;
-            }
-        }
-        if event.keystroke.key == "f2" {
-            self.begin_rename(window, cx);
+        if self.find.is_some() && event.keystroke.key == "escape" {
+            self.close_find(window, cx);
             cx.stop_propagation();
             return;
         }
-        let modifiers = event.keystroke.modifiers;
-        if !modifiers.secondary() || modifiers.alt {
+        let Some(action) = action else {
             return;
-        }
-        match event.keystroke.key.as_str() {
-            "p" => self.begin_switcher(window, cx),
-            "f" if modifiers.shift => self.begin_workspace_search(true, window, cx),
-            "f" => self.begin_find(window, cx),
-            "s" => {
+        };
+        match action {
+            Action::Switcher => self.begin_switcher(window, cx),
+            Action::WorkspaceSearch => self.begin_workspace_search(true, window, cx),
+            Action::Find => self.begin_find(window, cx),
+            Action::Save => {
                 self.save(cx);
             }
-            "n" => self.new_note(window, cx),
-            "backslash" | "\\" => self.toggle_split(window, cx),
-            "m" if modifiers.shift => self.begin_move(window, cx),
-            "tab" => self.step_tab(modifiers.shift, window, cx),
-            "w" => {
+            Action::NewNote => self.new_note(window, cx),
+            Action::Split => self.toggle_split(window, cx),
+            Action::Move => self.begin_move(window, cx),
+            Action::NextTab => self.step_tab(false, window, cx),
+            Action::PreviousTab => self.step_tab(true, window, cx),
+            Action::CloseTab => {
                 if let Some(path) = self.open.clone() {
                     self.close_tab(&path, window, cx);
                 }
             }
+            Action::Rename => self.begin_rename(window, cx),
+            Action::Back => self.navigate(true, window, cx),
+            Action::Forward => self.navigate(false, window, cx),
+            Action::NextMatch => self.step_find(false, cx),
+            Action::PreviousMatch => self.step_find(true, cx),
             _ => return,
         }
         cx.notify();
@@ -2598,21 +2634,110 @@ impl Wevren {
                     .child(action),
             )
             .child(rule(theme))
-            .child(label("FORMATTING SHORTCUTS", theme))
+            .child(label("KEYBOARD SHORTCUTS", theme))
             .child(
-                div().flex().flex_col().gap_2().children(
-                    [
-                        "Ctrl+B — Bold",
-                        "Ctrl+I — Italic",
-                        "Ctrl+1–6 — Heading level",
-                        "Ctrl+E — Inline code",
-                        "Ctrl+Shift+E — Code block",
-                    ]
-                    .into_iter()
-                    .map(|shortcut| div().font_family(theme.ui_font).text_sm().child(shortcut)),
-                ),
-            );
-        sheet(theme).items_center().child(column).into_any_element()
+                div().font_family(theme.ui_font).text_sm().text_color(theme.muted)
+                    .child("Click a binding, then press its new keys. Escape cancels. Changes save immediately."),
+            )
+            .child(
+                div().id("restore-shortcuts").px_3().py_1p5().rounded_md()
+                    .border_1().border_color(theme.accent).text_color(theme.accent)
+                    .font_family(theme.ui_font).text_sm().cursor_pointer()
+                    .hover(|style| style.bg(theme.hover))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.focus.focus(window);
+                        this.save_shortcuts(Bindings::default(), cx);
+                    }))
+                    .child("Restore default shortcuts"),
+            )
+            .children(self.shortcut_error.as_ref().filter(|_| self.shortcut_capture.is_none()).map(|error| {
+                div().text_color(theme.danger).font_family(theme.ui_font).text_sm().child(error.clone())
+            }))
+            .child(label("APP", theme))
+            .children(self.shortcut_rows(false, theme, cx))
+            .child(label("FORMATTING", theme))
+            .children(self.shortcut_rows(true, theme, cx))
+            .pb_8().flex_none();
+        sheet(theme)
+            .id("settings-page")
+            .min_h_0()
+            .overflow_y_scroll()
+            .items_center()
+            .child(column)
+            .into_any_element()
+    }
+
+    fn shortcut_rows(
+        &self,
+        formatting: bool,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<Stateful<Div>> {
+        shortcuts::DEFAULTS
+            .iter()
+            .filter(|(action, _, _)| action.formatting().is_some() == formatting)
+            .enumerate()
+            .map(|(index, &(action, name, _))| {
+                let capturing = self.shortcut_capture == Some(action);
+                div()
+                    .id((
+                        if formatting {
+                            "format-binding"
+                        } else {
+                            "app-binding"
+                        },
+                        index,
+                    ))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .w_full()
+                    .font_family(theme.ui_font)
+                    .text_sm()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .child(name)
+                            .child(
+                                div()
+                                    .id(("binding", action as usize))
+                                    .px_3()
+                                    .py_1p5()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(if capturing { theme.accent } else { theme.line })
+                                    .text_color(theme.accent)
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(theme.hover))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.shortcut_capture =
+                                            if this.shortcut_capture == Some(action) {
+                                                None
+                                            } else {
+                                                Some(action)
+                                            };
+                                        this.shortcut_error = None;
+                                        this.focus.focus(window);
+                                        cx.notify();
+                                    }))
+                                    .child(if capturing {
+                                        "Press keys (Esc or click to cancel)".to_owned()
+                                    } else {
+                                        self.settings.shortcuts.chord(action).to_string()
+                                    }),
+                            ),
+                    )
+                    .children(
+                        self.shortcut_error
+                            .as_ref()
+                            .filter(|_| capturing)
+                            .map(|error| div().text_color(theme.danger).child(error.clone())),
+                    )
+            })
+            .collect()
     }
 }
 
@@ -2685,6 +2810,8 @@ fn titlebar(
                 .cursor_pointer()
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.settings_open ^= true;
+                    this.shortcut_capture = None;
+                    this.shortcut_error = None;
                     cx.notify();
                 })),
         )
