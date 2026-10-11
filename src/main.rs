@@ -58,6 +58,8 @@ const CAPTION_GLYPHS: [&str; 3] = ["\u{e921}", "\u{e922}", "\u{e8bb}"];
 const SETTINGS_GLYPH: &str = "\u{e713}";
 /// Plus glyph in [`ICON_FONT`].
 const ADD_GLYPH: &str = "\u{e710}";
+const PIN_GLYPH: &str = "\u{e718}";
+const FOCUS_GLYPH: &str = "\u{e740}";
 /// Pause after the last edit before a note is written, sparing the disk while typing.
 const AUTOSAVE_DELAY: Duration = Duration::from_secs(1);
 
@@ -2570,54 +2572,11 @@ impl Wevren {
         } else {
             self.note_title(path, pane, theme, cx)
         };
-        let pinned = self.settings.pinned_notes.contains(path);
-        let pin_path = path.to_path_buf();
         let header = div()
             .flex()
             .items_start()
             .gap_3()
-            .child(div().flex_1().min_w_0().child(title))
-            .when(!self.focus_mode, |header| {
-                header
-                    .child(
-                        div()
-                            .id(("pin-note", pane))
-                            .flex_none()
-                            .px_3()
-                            .py_1()
-                            .rounded_md()
-                            .font_family(theme.ui_font)
-                            .text_size(px(13.))
-                            .text_color(if pinned { theme.accent } else { theme.muted })
-                            .border_1()
-                            .border_color(theme.line)
-                            .cursor_pointer()
-                            .hover(|style| style.bg(theme.hover).text_color(theme.text))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.toggle_pin(&pin_path, cx);
-                            }))
-                            .child(if pinned { "Unpin" } else { "Pin" }),
-                    )
-                    .child(
-                        div()
-                            .id(("focus-note", pane))
-                            .flex_none()
-                            .px_3()
-                            .py_1()
-                            .rounded_md()
-                            .font_family(theme.ui_font)
-                            .text_size(px(13.))
-                            .text_color(theme.muted)
-                            .border_1()
-                            .border_color(theme.line)
-                            .cursor_pointer()
-                            .hover(|style| style.bg(theme.hover).text_color(theme.text))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.enter_focus(pane, window, cx);
-                            }))
-                            .child("Focus"),
-                    )
-            });
+            .child(div().flex_1().min_w_0().child(title));
         let column = column()
             .max_w(px(f32::from(self.settings.typography.text_width)))
             .min_h_full()
@@ -2678,35 +2637,84 @@ impl Wevren {
             .min_w_0()
             .min_h_0()
             .gap_1()
-            .when(self.layout.split && !self.focus_mode, |view| {
+            .when(!self.focus_mode, |view| {
+                let pinned = tab.is_some_and(|tab| self.settings.pinned_notes.contains(&tab.path));
+                let path = tab.map(|tab| tab.path.clone());
                 view.child(
                     div()
                         .id(("pane-header", pane))
+                        .flex()
+                        .items_center()
+                        .gap_2()
                         .px_3()
                         .py_1()
-                        .truncate()
-                        .cursor_pointer()
-                        .text_size(px(11.))
-                        .text_color(if pane == self.layout.active {
-                            theme.accent
-                        } else {
-                            theme.muted
-                        })
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.select_pane(pane, window, cx);
-                        }))
-                        .child(format!(
-                            "{}{}",
-                            tab.map_or_else(
-                                || "No note is open".to_owned(),
-                                |tab| notes::title(&tab.path),
-                            ),
-                            if tab.is_some_and(|tab| tab.dirty || tab.conflict.is_some()) {
-                                " (unsaved changes)"
-                            } else {
-                                ""
-                            }
-                        )),
+                        .child(
+                            div()
+                                .id(("pane-select", pane))
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .cursor_pointer()
+                                .text_size(px(11.))
+                                .text_color(if pane == self.layout.active {
+                                    theme.accent
+                                } else {
+                                    theme.muted
+                                })
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.select_pane(pane, window, cx)
+                                }))
+                                .child(format!(
+                                    "{}{}",
+                                    tab.map_or_else(
+                                        || "No note is open".to_owned(),
+                                        |tab| notes::title(&tab.path)
+                                    ),
+                                    if tab.is_some_and(|tab| tab.dirty || tab.conflict.is_some()) {
+                                        " (unsaved changes)"
+                                    } else {
+                                        ""
+                                    }
+                                )),
+                        )
+                        .when(pane == self.layout.active && tab.is_some(), |header| {
+                            let pin_path = path.expect("note tab has a path");
+                            header
+                                .child(
+                                    div()
+                                        .id(("pin-note", pane))
+                                        .flex_none()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .font_family(ICON_FONT)
+                                        .text_size(px(14.))
+                                        .text_color(if pinned { theme.accent } else { theme.muted })
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(theme.hover).text_color(theme.text))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.toggle_pin(&pin_path, cx)
+                                        }))
+                                        .child(PIN_GLYPH),
+                                )
+                                .child(
+                                    div()
+                                        .id(("focus-note", pane))
+                                        .flex_none()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .font_family(ICON_FONT)
+                                        .text_size(px(14.))
+                                        .text_color(theme.muted)
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(theme.hover).text_color(theme.text))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.enter_focus(pane, window, cx)
+                                        }))
+                                        .child(FOCUS_GLYPH),
+                                )
+                        }),
                 )
             })
             .when(tab.is_none(), |view| {
