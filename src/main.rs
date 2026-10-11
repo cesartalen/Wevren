@@ -414,6 +414,49 @@ impl Wevren {
         cx.notify();
     }
 
+    /// Shows the note at `path` in the left or right pane, splitting the page to make room.
+    fn place_note(
+        &mut self,
+        path: PathBuf,
+        pane: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let other = 1 - pane;
+        if self.layout.split {
+            if self.layout.paths[other].as_ref() == Some(&path) {
+                self.layout.paths.swap(0, 1);
+            }
+            self.select_pane(pane, window, cx);
+        } else if self.open.as_ref().is_some_and(|open| *open != path) {
+            self.store_active_tab();
+            self.layout.split = true;
+            self.layout.paths = [None, None];
+            self.layout.paths[other].clone_from(&self.open);
+            self.layout.active = other;
+            self.select_pane(pane, window, cx);
+        }
+        self.open_note(path, window, cx);
+    }
+
+    /// Returns the half of the page that takes a dragged note into the pane on that side.
+    fn drop_zone(pane: usize, theme: Theme, cx: &mut Context<Self>) -> Div {
+        div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .w(relative(0.5))
+            .when(pane == 0, Styled::left_0)
+            .when(pane == 1, Styled::right_0)
+            .rounded(px(14.))
+            .drag_over::<DraggedNote>(move |style, _, _, _| {
+                style.border_2().border_color(theme.accent)
+            })
+            .on_drop(cx.listener(move |this, note: &DraggedNote, window, cx| {
+                this.place_note(note.0.clone(), pane, window, cx);
+            }))
+    }
+
     fn save_all(&mut self, cx: &App) -> bool {
         let active_saved = self.save(cx);
         self.store_active_tab();
@@ -1174,6 +1217,9 @@ impl Wevren {
                 self.focus.focus(window);
             }
         }
+        if self.layout.split && self.layout.paths.contains(&None) {
+            self.toggle_split(window, cx);
+        }
         cx.notify();
     }
 
@@ -1201,6 +1247,7 @@ impl Wevren {
         let tabs = self.tabs.iter().enumerate().map(|(index, tab)| {
             let path = tab.path.clone();
             let close_path = path.clone();
+            let dragged = DraggedNote(path.clone());
             let active = self.open.as_ref() == Some(&path) && !self.settings_open;
             let title = notes::title(&path);
             let duplicate = self
@@ -1236,6 +1283,7 @@ impl Wevren {
                 .when(active, |tab| tab.bg(theme.sheet))
                 .hover(|tab| tab.bg(theme.hover))
                 .child(div().min_w_0().truncate().child(title))
+                .on_drag(dragged, |note, _, _, cx| cx.new(|_| note.clone()))
                 .child(
                     div()
                         .id(("close-tab", index))
@@ -1264,23 +1312,7 @@ impl Wevren {
                 .gap_1()
                 .w_full()
                 .overflow_x_scroll()
-                .children(tabs)
-                .child(
-                    div()
-                        .id("split-panes")
-                        .flex_none()
-                        .px_3()
-                        .py_2()
-                        .cursor_pointer()
-                        .text_color(theme.muted)
-                        .hover(|button| button.text_color(theme.accent))
-                        .on_click(cx.listener(|this, _, window, cx| this.toggle_split(window, cx)))
-                        .child(if self.layout.split {
-                            "Close split"
-                        } else {
-                            "Split"
-                        }),
-                ),
+                .children(tabs),
         )
     }
 
@@ -2742,6 +2774,7 @@ impl Render for Wevren {
             self.settings_page(theme, cx)
         } else {
             div()
+                .relative()
                 .flex()
                 .flex_1()
                 .min_h_0()
@@ -2750,6 +2783,9 @@ impl Render for Wevren {
                 .child(self.pane_page(0, theme, cx))
                 .when(self.layout.split, |view| {
                     view.child(self.pane_page(1, theme, cx))
+                })
+                .when(cx.has_active_drag(), |view| {
+                    view.children([0, 1].map(|pane| Self::drop_zone(pane, theme, cx)))
                 })
                 .into_any_element()
         };
