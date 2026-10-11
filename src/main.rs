@@ -100,6 +100,16 @@ struct PaneLayout {
     active: usize,
 }
 
+impl PaneLayout {
+    fn visible_panes(&self, focus_mode: bool) -> Range<usize> {
+        if focus_mode {
+            self.active..self.active + 1
+        } else {
+            0..if self.split { 2 } else { 1 }
+        }
+    }
+}
+
 /// The root view.
 #[derive(Debug)]
 struct Wevren {
@@ -107,6 +117,7 @@ struct Wevren {
     settings: Settings,
     /// Whether the settings page covers the open note.
     settings_open: bool,
+    focus_mode: bool,
     shortcut_capture: Option<Action>,
     shortcut_error: Option<String>,
     /// Why the last operation failed.
@@ -153,6 +164,7 @@ impl Wevren {
             focus: cx.focus_handle(),
             settings,
             settings_open: false,
+            focus_mode: false,
             shortcut_capture: None,
             shortcut_error: None,
             error: None,
@@ -420,6 +432,30 @@ impl Wevren {
                 .find(|tab| Some(&tab.path) != self.open.as_ref())
                 .map(|tab| tab.path.clone());
             self.select_pane(1, window, cx);
+        }
+        cx.notify();
+    }
+
+    fn enter_focus(&mut self, pane: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.layout.paths[pane]
+            .as_ref()
+            .is_some_and(|path| self.tabs.iter().any(|tab| tab.path == *path))
+        {
+            return;
+        }
+        self.select_pane(pane, window, cx);
+        self.rename_editor = None;
+        self.focus_mode = true;
+        self.editor.focus_handle(cx).focus(window);
+        cx.notify();
+    }
+
+    fn exit_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_mode = false;
+        if self.open.is_some() {
+            self.editor.focus_handle(cx).focus(window);
+        } else {
+            self.focus.focus(window);
         }
         cx.notify();
     }
@@ -1587,6 +1623,7 @@ impl Wevren {
         let Some(path) = &self.open else {
             return;
         };
+        self.focus_mode = false;
         if self.rename_editor.is_none() {
             let title = notes::title(path);
             let input = cx.new(|cx| Editor::single_line(title, cx));
@@ -2074,6 +2111,11 @@ impl Wevren {
             cx.stop_propagation();
             return;
         }
+        if self.focus_mode && event.keystroke.key == "escape" {
+            self.exit_focus(window, cx);
+            cx.stop_propagation();
+            return;
+        }
         let Some(action) = action else {
             return;
         };
@@ -2523,7 +2565,11 @@ impl Wevren {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let active = pane == self.layout.active;
-        let title = self.note_title(path, pane, theme, cx);
+        let title = if self.focus_mode {
+            heading(notes::title(path), theme).into_any_element()
+        } else {
+            self.note_title(path, pane, theme, cx)
+        };
         let pinned = self.settings.pinned_notes.contains(path);
         let pin_path = path.to_path_buf();
         let header = div()
@@ -2531,25 +2577,47 @@ impl Wevren {
             .items_start()
             .gap_3()
             .child(div().flex_1().min_w_0().child(title))
-            .child(
-                div()
-                    .id(("pin-note", pane))
-                    .flex_none()
-                    .px_3()
-                    .py_1()
-                    .rounded_md()
-                    .font_family(theme.ui_font)
-                    .text_size(px(13.))
-                    .text_color(if pinned { theme.accent } else { theme.muted })
-                    .border_1()
-                    .border_color(theme.line)
-                    .cursor_pointer()
-                    .hover(|style| style.bg(theme.hover).text_color(theme.text))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.toggle_pin(&pin_path, cx);
-                    }))
-                    .child(if pinned { "Unpin" } else { "Pin" }),
-            );
+            .when(!self.focus_mode, |header| {
+                header
+                    .child(
+                        div()
+                            .id(("pin-note", pane))
+                            .flex_none()
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .font_family(theme.ui_font)
+                            .text_size(px(13.))
+                            .text_color(if pinned { theme.accent } else { theme.muted })
+                            .border_1()
+                            .border_color(theme.line)
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme.hover).text_color(theme.text))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_pin(&pin_path, cx);
+                            }))
+                            .child(if pinned { "Unpin" } else { "Pin" }),
+                    )
+                    .child(
+                        div()
+                            .id(("focus-note", pane))
+                            .flex_none()
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .font_family(theme.ui_font)
+                            .text_size(px(13.))
+                            .text_color(theme.muted)
+                            .border_1()
+                            .border_color(theme.line)
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme.hover).text_color(theme.text))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.enter_focus(pane, window, cx);
+                            }))
+                            .child("Focus"),
+                    )
+            });
         let column = column()
             .max_w(px(f32::from(self.settings.typography.text_width)))
             .min_h_full()
@@ -2610,7 +2678,7 @@ impl Wevren {
             .min_w_0()
             .min_h_0()
             .gap_1()
-            .when(self.layout.split, |view| {
+            .when(self.layout.split && !self.focus_mode, |view| {
                 view.child(
                     div()
                         .id(("pane-header", pane))
@@ -2987,6 +3055,7 @@ fn titlebar(
     theme: Theme,
     can_back: bool,
     can_forward: bool,
+    focus_mode: bool,
     cx: &mut Context<Wevren>,
 ) -> impl IntoElement {
     let [min, max, close] = CAPTION_GLYPHS;
@@ -2994,24 +3063,26 @@ fn titlebar(
         .flex()
         .flex_none()
         .h(px(TITLEBAR_HEIGHT))
-        .children(
-            [
-                ("\u{e72b}", true, can_back),
-                ("\u{e72a}", false, can_forward),
-            ]
-            .into_iter()
-            .map(|(glyph, back, enabled)| {
-                icon_button(glyph, 12., theme.hover, theme)
-                    .when(enabled, Styled::cursor_pointer)
-                    .when(!enabled, |button| button.opacity(0.35))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        if enabled {
-                            this.navigate(back, window, cx);
-                        }
-                    }))
-            }),
-        )
+        .when(!focus_mode, |bar| {
+            bar.children(
+                [
+                    ("\u{e72b}", true, can_back),
+                    ("\u{e72a}", false, can_forward),
+                ]
+                .into_iter()
+                .map(|(glyph, back, enabled)| {
+                    icon_button(glyph, 12., theme.hover, theme)
+                        .when(enabled, Styled::cursor_pointer)
+                        .when(!enabled, |button| button.opacity(0.35))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            if enabled {
+                                this.navigate(back, window, cx);
+                            }
+                        }))
+                }),
+            )
+        })
         .child(
             div()
                 .flex()
@@ -3025,33 +3096,53 @@ fn titlebar(
                 .text_color(theme.muted)
                 .child("Wevren"),
         )
-        .child(
-            icon_button(SETTINGS_GLYPH, 13., theme.hover, theme)
-                .cursor_pointer()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.settings_open ^= true;
-                    this.shortcut_capture = None;
-                    this.shortcut_error = None;
-                    cx.notify();
-                })),
-        )
-        .child(
-            caption("theme")
-                .cursor_pointer()
-                .hover(|s| s.bg(theme.hover))
-                .on_click(cx.listener(move |_, _, _, cx| {
-                    cx.set_global(theme.toggled());
-                    cx.notify();
-                }))
-                .child(
-                    div()
-                        .size(px(11.))
-                        .rounded_full()
-                        .border_1()
-                        .border_color(theme.muted)
-                        .when(theme.dark, |d| d.bg(theme.muted)),
-                ),
-        )
+        .when(!focus_mode, |bar| {
+            bar.child(
+                icon_button(SETTINGS_GLYPH, 13., theme.hover, theme)
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.settings_open ^= true;
+                        this.shortcut_capture = None;
+                        this.shortcut_error = None;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                caption("theme")
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.hover))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.set_global(theme.toggled());
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .size(px(11.))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(theme.muted)
+                            .when(theme.dark, |d| d.bg(theme.muted)),
+                    ),
+            )
+        })
+        .when(focus_mode, |bar| {
+            bar.child(
+                div()
+                    .id("exit-focus")
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .px_4()
+                    .text_color(theme.accent)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme.hover))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.exit_focus(window, cx);
+                    }))
+                    .child("Exit focus"),
+            )
+        })
         .child(
             icon_button(min, 10., theme.hover, theme)
                 .cursor_pointer()
@@ -3261,11 +3352,12 @@ impl Render for Wevren {
                 .min_h_0()
                 .min_w_0()
                 .gap_2()
-                .child(self.pane_page(0, theme, cx))
-                .when(self.layout.split, |view| {
-                    view.child(self.pane_page(1, theme, cx))
-                })
-                .when(cx.has_active_drag(), |view| {
+                .children(
+                    self.layout
+                        .visible_panes(self.focus_mode)
+                        .map(|pane| self.pane_page(pane, theme, cx)),
+                )
+                .when(cx.has_active_drag() && !self.focus_mode, |view| {
                     view.children([0, 1].map(|pane| Self::drop_zone(pane, theme, cx)))
                 })
                 .into_any_element()
@@ -3288,6 +3380,7 @@ impl Render for Wevren {
                 theme,
                 self.navigation_target(true).is_some(),
                 self.navigation_target(false).is_some(),
+                self.focus_mode,
                 cx,
             ))
             .child(
@@ -3299,7 +3392,9 @@ impl Render for Wevren {
                     .gap_2()
                     .px_2()
                     .pb_2()
-                    .when(has_folder, |body| body.child(self.sidebar(theme, cx)))
+                    .when(has_folder && !self.focus_mode, |body| {
+                        body.child(self.sidebar(theme, cx))
+                    })
                     .child(
                         div()
                             .flex()
@@ -3308,13 +3403,70 @@ impl Render for Wevren {
                             .min_w_0()
                             .min_h_0()
                             .gap_2()
-                            .children(self.tab_bar(theme, cx))
+                            .when(!self.focus_mode, |view| {
+                                view.children(self.tab_bar(theme, cx))
+                            })
                             .child(page),
                     ),
             )
             .children(error)
             .children(self.switcher_page(theme, cx))
             .children(self.move_page(theme, cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PaneLayout;
+    use std::path::PathBuf;
+
+    #[test]
+    fn focus_projects_either_split_pane_and_restores_the_layout() {
+        let paths = [
+            Some(PathBuf::from("left.md")),
+            Some(PathBuf::from("right.md")),
+        ];
+        for active in 0..2 {
+            let layout = PaneLayout {
+                split: true,
+                paths: paths.clone(),
+                active,
+            };
+            let normal: Vec<_> = layout.visible_panes(false).collect();
+            let focused: Vec<_> = layout
+                .visible_panes(true)
+                .map(|pane| layout.paths[pane].clone())
+                .collect();
+            assert_eq!(focused, vec![paths[active].clone()]);
+            assert_eq!(layout.visible_panes(false).collect::<Vec<_>>(), normal);
+            assert_eq!(normal, vec![0, 1]);
+            assert_eq!(layout.paths, paths);
+            assert_eq!(layout.active, active);
+            assert!(layout.split);
+        }
+    }
+
+    #[test]
+    fn focused_empty_pane_does_not_replace_the_hidden_note() {
+        let mut layout = PaneLayout {
+            split: true,
+            paths: [
+                Some(PathBuf::from("left.md")),
+                Some(PathBuf::from("right.md")),
+            ],
+            active: 1,
+        };
+        layout.paths[layout.active] = None;
+        assert_eq!(layout.visible_panes(true).collect::<Vec<_>>(), vec![1]);
+        assert!(layout.paths[layout.active].is_none());
+        assert_eq!(layout.visible_panes(false).collect::<Vec<_>>(), vec![0, 1]);
+        assert_eq!(layout.paths[0], Some(PathBuf::from("left.md")));
+        assert_eq!(
+            PaneLayout::default()
+                .visible_panes(false)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
     }
 }
 
