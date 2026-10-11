@@ -2760,7 +2760,7 @@ impl Render for DraggedNote {
             .parent()
             .and_then(Path::file_name)
             .map(|name| name.to_string_lossy().into_owned());
-        div().pl(self.1.x + px(10.)).pt(self.1.y + px(10.)).child(
+        div().pl(self.1.x + px(2.)).pt(self.1.y + px(2.)).child(
             div()
                 .flex()
                 .items_center()
