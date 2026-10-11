@@ -2699,6 +2699,9 @@ impl Wevren {
                                         .text_color(if pinned { theme.accent } else { theme.muted })
                                         .cursor_pointer()
                                         .hover(|style| style.bg(theme.hover).text_color(theme.text))
+                                        .tooltip(|_, cx| {
+                                            cx.new(|_| ActionTooltip("Pin note")).into()
+                                        })
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.toggle_pin(&pin_path, cx)
                                         }))
@@ -2719,6 +2722,9 @@ impl Wevren {
                                         .text_color(theme.muted)
                                         .cursor_pointer()
                                         .hover(|style| style.bg(theme.hover).text_color(theme.text))
+                                        .tooltip(|_, cx| {
+                                            cx.new(|_| ActionTooltip("Focus note")).into()
+                                        })
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             this.enter_focus(pane, window, cx)
                                         }))
@@ -3282,6 +3288,26 @@ fn empty_page(theme: Theme) -> AnyElement {
         .child(rule(theme))
         .child("No note is open")
         .into_any_element()
+}
+
+/// Hover label shown for an icon action.
+struct ActionTooltip(&'static str);
+
+impl Render for ActionTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.global::<Theme>();
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(theme.sheet)
+            .border_1()
+            .border_color(theme.line)
+            .font_family(theme.ui_font)
+            .text_size(px(12.))
+            .text_color(theme.text)
+            .child(self.0)
+    }
 }
 
 /// Note dragged from the note list, shown under the pointer by its title.
