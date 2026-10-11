@@ -13,6 +13,13 @@ pub struct LineStyle {
     pub emphasis: Vec<Emphasis>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct OutlineHeading {
+    pub offset: usize,
+    pub level: u8,
+    pub title: String,
+}
+
 #[derive(Debug)]
 struct Delimiter {
     start: usize,
@@ -90,6 +97,30 @@ pub fn styles(text: &str) -> Vec<LineStyle> {
                 heading: heading(line),
                 emphasis: emphasis(line),
             }
+        })
+        .collect()
+}
+
+pub fn outline(text: &str) -> Vec<OutlineHeading> {
+    let mut offset = 0;
+    text.split_inclusive('\n')
+        .zip(styles(text))
+        .filter_map(|(line, style)| {
+            let start = offset;
+            offset += line.len();
+            let level = style.heading?;
+            let title = line.trim_start_matches(' ')[usize::from(level)..].trim();
+            let without_hashes = title.trim_end_matches('#');
+            let title = if without_hashes.is_empty() || without_hashes.ends_with([' ', '\t']) {
+                without_hashes.trim_end()
+            } else {
+                title
+            };
+            Some(OutlineHeading {
+                offset: start,
+                level,
+                title: title.to_owned(),
+            })
         })
         .collect()
 }
@@ -207,5 +238,46 @@ pub fn heading_scale(level: u8) -> f32 {
         4 => 1.125,
         5 => 1.0625,
         _ => 1.,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OutlineHeading, outline};
+
+    #[test]
+    fn outline_keeps_utf8_byte_offsets_and_heading_levels() {
+        let text = "é📝\r\n# Café ###\r\n  ### 日本語#\n######\n";
+        assert_eq!(
+            outline(text),
+            vec![
+                OutlineHeading {
+                    offset: text.find("# Café").unwrap(),
+                    level: 1,
+                    title: "Café".to_owned(),
+                },
+                OutlineHeading {
+                    offset: text.find("  ###").unwrap(),
+                    level: 3,
+                    title: "日本語#".to_owned(),
+                },
+                OutlineHeading {
+                    offset: text.find("######").unwrap(),
+                    level: 6,
+                    title: String::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn outline_ignores_code_and_invalid_heading_markers() {
+        let text = "```md\n# fenced\n```\n~~~\n## fenced too\n~~~\n    # indented\n\t# tabbed\n#nospace\n####### too many\n## Visible";
+        let headings = outline(text);
+        assert_eq!(headings.len(), 1);
+        assert_eq!(headings[0].title, "Visible");
+        assert_eq!(headings[0].offset, text.find("## Visible").unwrap());
+        assert!(outline("").is_empty());
+        assert!(outline("Plain text\n").is_empty());
     }
 }

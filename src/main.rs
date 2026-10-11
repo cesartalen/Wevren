@@ -193,6 +193,7 @@ impl Wevren {
             this.select_editor(source, window, cx);
             this.schedule_save(cx);
             this.refresh_find(false, cx);
+            cx.notify();
         })
         .detach();
         cx.subscribe_in(
@@ -2084,19 +2085,94 @@ impl Wevren {
                     ),
                 )
         });
-        div()
+        let list = div()
             .id("notes")
             .flex()
             .flex_col()
-            .flex_none()
-            .w(px(SIDEBAR_WIDTH))
+            .flex_1()
+            .min_h_0()
             .pt_3()
             .overflow_y_scroll()
             .on_drop(drop_root)
             .child(header)
             .children(folder_input)
             .when(self.entries.is_empty(), |list| list.child(empty))
-            .children(rows)
+            .children(rows);
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .min_h_0()
+            .w(px(SIDEBAR_WIDTH))
+            .child(list)
+            .when(!self.settings_open, |sidebar| {
+                sidebar.children(self.outline_panel(theme, cx))
+            })
+    }
+
+    fn outline_panel(&self, theme: Theme, cx: &mut Context<Self>) -> Option<Div> {
+        let path = self.open.as_ref()?;
+        let headings = markdown::outline(self.editor.read(cx).text());
+        let empty = headings.is_empty();
+        let editor = self.editor.clone();
+        let rows = headings.into_iter().map(|heading| {
+            let offset = heading.offset;
+            let editor = editor.clone();
+            div()
+                .id(("outline-heading", offset))
+                .flex_none()
+                .pl(px(8. + f32::from(heading.level - 1) * 12.))
+                .pr_2()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.hover).text_color(theme.text))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if this.open.is_some() && this.editor == editor {
+                        editor.update(cx, |editor, cx| editor.select_range(offset..offset, cx));
+                        editor.focus_handle(cx).focus(window);
+                    }
+                }))
+                .child(div().truncate().child(if heading.title.is_empty() {
+                    "Untitled heading".to_owned()
+                } else {
+                    heading.title
+                }))
+        });
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .flex_none()
+                .gap_1()
+                .border_t_1()
+                .border_color(theme.line)
+                .mt_2()
+                .pt_3()
+                .pb_2()
+                .child(label("OUTLINE", theme).px_3())
+                .child(
+                    div()
+                        .px_3()
+                        .text_size(px(11.))
+                        .text_color(theme.faint)
+                        .truncate()
+                        .child(notes::title(path)),
+                )
+                .child(
+                    div()
+                        .id("note-outline")
+                        .mx_1()
+                        .max_h(px(200.))
+                        .overflow_y_scroll()
+                        .text_size(px(12.))
+                        .text_color(theme.muted)
+                        .when(empty, |list| {
+                            list.child(div().px_2().py_1().child("No headings yet"))
+                        })
+                        .children(rows),
+                ),
+        )
     }
 
     fn sidebar_header(theme: Theme, cx: &mut Context<Self>) -> Div {
