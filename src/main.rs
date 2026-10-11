@@ -9,6 +9,7 @@ mod formatting;
 mod links;
 mod markdown;
 mod notes;
+mod panes;
 mod search;
 mod session;
 mod settings;
@@ -18,12 +19,14 @@ mod window_controls;
 mod workspace_search;
 
 use std::{
+    cell::RefCell,
     cmp::Reverse,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt::Display,
     io,
     ops::Range,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -38,6 +41,7 @@ use gpui::{
     WindowBounds, WindowControlArea, WindowOptions, div, prelude::*, px, relative, size,
 };
 use mimalloc::MiMalloc;
+use panes::{Axis, Edge, Layout as PaneLayout, Node, PaneId};
 use settings::{EditorFont, Settings, Typography};
 use shortcuts::{Action, Bindings, Chord};
 use theme::Theme;
@@ -67,6 +71,20 @@ const PIN_GLYPH: &str = "\u{e718}";
 const FOCUS_GLYPH: &str = "\u{e740}";
 /// Pause after the last edit before a note is written, sparing the disk while typing.
 const AUTOSAVE_DELAY: Duration = Duration::from_secs(1);
+
+fn split_ratio(
+    axis: Axis,
+    bounds: Bounds<gpui::Pixels>,
+    position: gpui::Point<gpui::Pixels>,
+) -> Option<f32> {
+    let (offset, length) = match axis {
+        Axis::Horizontal => (position.x - bounds.origin.x, bounds.size.width),
+        Axis::Vertical => (position.y - bounds.origin.y, bounds.size.height),
+    };
+    let offset = f32::from(offset);
+    let length = f32::from(length);
+    (length > 6. && length.is_finite() && offset.is_finite()).then(|| (offset - 3.) / (length - 6.))
+}
 
 #[derive(Debug)]
 struct Find {
@@ -98,23 +116,6 @@ struct Tab {
     baseline: Option<String>,
     dirty: bool,
     conflict: Option<Conflict>,
-}
-
-#[derive(Debug, Default)]
-struct PaneLayout {
-    split: bool,
-    paths: [Option<PathBuf>; 2],
-    active: usize,
-}
-
-impl PaneLayout {
-    fn visible_panes(&self, focus_mode: bool) -> Range<usize> {
-        if focus_mode {
-            self.active..self.active + 1
-        } else {
-            0..if self.split { 2 } else { 1 }
-        }
-    }
 }
 
 /// The root view.
@@ -155,6 +156,8 @@ struct Wevren {
     backlinks_task: Option<Task<anyhow::Result<()>>>,
     move_picker: bool,
     layout: PaneLayout,
+    layout_bounds: Rc<RefCell<HashMap<usize, Bounds<gpui::Pixels>>>>,
+    resizing: bool,
     last_session: Option<session::Session>,
 }
 
@@ -201,6 +204,8 @@ impl Wevren {
             backlinks_task: None,
             move_picker: false,
             layout: PaneLayout::default(),
+            layout_bounds: Rc::new(RefCell::new(HashMap::new())),
+            resizing: false,
             last_session: None,
         };
         this.reload(cx);
@@ -281,22 +286,14 @@ impl Wevren {
                 conflict: None,
             });
         }
-        let active_had_note = saved.panes[saved.active].is_some();
-        self.layout = PaneLayout {
-            split: saved.split,
-            active: saved.active,
-            paths: saved
-                .panes
-                .clone()
-                .map(|path| path.filter(|path| self.tabs.iter().any(|tab| tab.path == *path))),
-        };
-        if active_had_note
-            && self.layout.paths[self.layout.active].is_none()
-            && self.layout.paths[1 - self.layout.active].is_some()
-        {
-            self.layout.active = 1 - self.layout.active;
-        }
-        if let Some(path) = &self.layout.paths[self.layout.active]
+        self.layout = saved.layout.clone().unwrap_or_default();
+        self.layout.sanitize(|path| {
+            self.tabs
+                .iter()
+                .find(|tab| tab.path == path)
+                .map(|tab| tab.path.clone())
+        });
+        if let Some(path) = self.layout.path(self.layout.active)
             && let Some(index) = self.tabs.iter().position(|tab| tab.path == *path)
         {
             self.load_tab_state(index);
@@ -329,9 +326,10 @@ impl Wevren {
                     view: tab.editor.read(cx).session_view(),
                 })
                 .collect(),
-            panes: self.layout.paths.clone(),
-            split: self.layout.split,
-            active: self.layout.active,
+            layout: Some(self.layout.clone()),
+            panes: [None, None],
+            split: false,
+            active: 0,
             expanded,
             selected_folder: self.selected_folder.clone(),
         };
@@ -359,12 +357,10 @@ impl Wevren {
         self.baseline.clone_from(&tab.baseline);
         self.conflict.clone_from(&tab.conflict);
         self.dirty = tab.dirty;
-        if self.layout.split
-            && self.layout.paths[1 - self.layout.active].as_ref() == Some(&tab.path)
-        {
-            self.layout.active = 1 - self.layout.active;
+        if let Some(pane) = self.layout.pane_for(&tab.path) {
+            self.layout.active = pane;
         }
-        self.layout.paths[self.layout.active].clone_from(&self.open);
+        self.layout.set_path(self.layout.active, self.open.clone());
         self.selected_folder = tab.path.parent().map(Path::to_path_buf);
         self.find = None;
         self.rename_editor = None;
@@ -397,8 +393,11 @@ impl Wevren {
         cx.notify();
     }
 
-    fn select_pane(&mut self, pane: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(path) = &self.layout.paths[pane]
+    fn select_pane(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.layout.contains(pane) {
+            return;
+        }
+        if let Some(path) = self.layout.path(pane)
             && let Some(tab) = self.tabs.iter().find(|tab| tab.path == *path)
         {
             let editor = tab.editor.clone();
@@ -422,35 +421,40 @@ impl Wevren {
         cx.notify();
     }
 
-    fn toggle_split(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn split_pane(
+        &mut self,
+        pane: PaneId,
+        edge: Edge,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.store_active_tab();
-        if self.layout.split {
-            let keep = self
-                .open
-                .clone()
-                .or_else(|| self.layout.paths[1 - self.layout.active].clone());
-            self.layout.split = false;
-            self.layout.paths = [keep, None];
-            self.layout.active = 0;
-            if self.open.is_none() {
-                self.select_pane(0, window, cx);
-            }
-        } else {
-            self.layout.split = true;
-            self.layout.paths[0].clone_from(&self.open);
-            self.layout.paths[1] = self
-                .tabs
-                .iter()
-                .find(|tab| Some(&tab.path) != self.open.as_ref())
-                .map(|tab| tab.path.clone());
-            self.select_pane(1, window, cx);
+        let Some(new) = self.layout.split(pane, edge) else {
+            return;
+        };
+        let path = self
+            .tabs
+            .iter()
+            .find(|tab| self.layout.pane_for(&tab.path).is_none())
+            .map(|tab| tab.path.clone());
+        self.layout.set_path(new, path);
+        self.select_pane(new, window, cx);
+    }
+
+    fn close_pane(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.layout.contains(pane) {
+            return;
         }
+        self.store_active_tab();
+        self.layout.close(pane);
+        self.select_pane(self.layout.active, window, cx);
         cx.notify();
     }
 
-    fn enter_focus(&mut self, pane: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.layout.paths[pane]
-            .as_ref()
+    fn enter_focus(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        if !self
+            .layout
+            .path(pane)
             .is_some_and(|path| self.tabs.iter().any(|tab| tab.path == *path))
         {
             return;
@@ -472,47 +476,172 @@ impl Wevren {
         cx.notify();
     }
 
-    /// Shows the note at `path` in the left or right pane, splitting the page to make room.
     fn place_note(
         &mut self,
         path: PathBuf,
-        pane: usize,
+        pane: PaneId,
+        edge: Option<Edge>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let other = 1 - pane;
-        if self.layout.split {
-            if self.layout.paths[other].as_ref() == Some(&path) {
-                self.layout.paths.swap(0, 1);
-            }
-            self.select_pane(pane, window, cx);
-        } else if self.open.as_ref().is_some_and(|open| *open != path) {
-            self.store_active_tab();
-            self.layout.split = true;
-            self.layout.paths = [None, None];
-            self.layout.paths[other].clone_from(&self.open);
-            self.layout.active = other;
-            self.select_pane(pane, window, cx);
+        if !self.layout.contains(pane)
+            || (!path.is_file() && !self.tabs.iter().any(|tab| tab.path == path))
+        {
+            return;
         }
-        self.open_note(path, window, cx);
+        if let Some(source) = self.layout.pane_for(&path) {
+            if let Some(edge) = edge {
+                if !self.layout.move_pane(source, pane, edge) {
+                    return;
+                }
+            }
+            self.select_pane(source, window, cx);
+        } else {
+            let target = if let Some(edge) = edge {
+                let Some(target) = self.layout.split(pane, edge) else {
+                    return;
+                };
+                target
+            } else {
+                pane
+            };
+            self.select_pane(target, window, cx);
+            self.open_note(path, window, cx);
+        }
+        cx.notify();
     }
 
-    /// Returns the half of the page that takes a dragged note into the pane on that side.
-    fn drop_zone(pane: usize, theme: Theme, cx: &mut Context<Self>) -> Div {
+    fn pane_drop_zone(
+        pane: PaneId,
+        edge: Option<Edge>,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let index = match edge {
+            None => 0,
+            Some(Edge::Left) => 1,
+            Some(Edge::Right) => 2,
+            Some(Edge::Above) => 3,
+            Some(Edge::Below) => 4,
+        };
         div()
+            .id((SharedString::from(format!("pane-drop-{pane}")), index))
             .absolute()
-            .top_0()
-            .bottom_0()
-            .w(relative(0.5))
-            .when(pane == 0, Styled::left_0)
-            .when(pane == 1, Styled::right_0)
-            .rounded(px(14.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .text_size(px(11.))
+            .text_color(theme.text)
+            .bg(Rgba {
+                a: 0.9,
+                ..theme.sheet
+            })
+            .border_1()
+            .border_color(theme.line)
+            .when(edge == Some(Edge::Left), |zone| {
+                zone.left_0()
+                    .top(relative(0.25))
+                    .bottom(relative(0.25))
+                    .w(relative(0.25))
+            })
+            .when(edge == Some(Edge::Right), |zone| {
+                zone.right_0()
+                    .top(relative(0.25))
+                    .bottom(relative(0.25))
+                    .w(relative(0.25))
+            })
+            .when(edge == Some(Edge::Above), |zone| {
+                zone.top_0().left_0().right_0().h(relative(0.25))
+            })
+            .when(edge == Some(Edge::Below), |zone| {
+                zone.bottom_0().left_0().right_0().h(relative(0.25))
+            })
+            .when(edge.is_none(), |zone| {
+                zone.left(relative(0.25))
+                    .right(relative(0.25))
+                    .top(relative(0.25))
+                    .bottom(relative(0.25))
+            })
             .drag_over::<DraggedNote>(move |style, _, _, _| {
                 style.border_2().border_color(theme.accent)
             })
+            .drag_over::<DraggedPane>(move |style, _, _, _| {
+                style.border_2().border_color(theme.accent)
+            })
             .on_drop(cx.listener(move |this, note: &DraggedNote, window, cx| {
-                this.place_note(note.0.clone(), pane, window, cx);
+                this.place_note(note.0.clone(), pane, edge, window, cx)
             }))
+            .on_drop(cx.listener(move |this, source: &DraggedPane, window, cx| {
+                this.drop_pane(source.0, pane, edge, window, cx);
+            }))
+            .child(edge.map_or("Open / focus", Edge::label))
+    }
+
+    fn drop_pane(
+        &mut self,
+        source: PaneId,
+        target: PaneId,
+        edge: Option<Edge>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.layout.contains(source) || !self.layout.contains(target) {
+            return;
+        }
+        if let Some(edge) = edge {
+            if !self.layout.move_pane(source, target, edge) {
+                return;
+            }
+        }
+        self.select_pane(source, window, cx);
+        cx.notify();
+    }
+
+    fn drop_edge(&self, pane: PaneId, position: gpui::Point<gpui::Pixels>) -> Option<Option<Edge>> {
+        let bounds = self.layout_bounds.borrow().get(&pane).copied()?;
+        let width = f32::from(bounds.size.width);
+        let height = f32::from(bounds.size.height);
+        if !bounds.contains(&position)
+            || width <= 0.
+            || height <= 0.
+            || !width.is_finite()
+            || !height.is_finite()
+        {
+            return None;
+        }
+        Some(Edge::at(
+            f32::from(position.x - bounds.origin.x) / width,
+            f32::from(position.y - bounds.origin.y) / height,
+        ))
+    }
+
+    fn capture_layout_bounds(&self, id: usize) -> impl IntoElement {
+        let layout_bounds = Rc::clone(&self.layout_bounds);
+        gpui::canvas(
+            move |bounds, _, _| {
+                layout_bounds.borrow_mut().insert(id, bounds);
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+    }
+
+    fn resize_split(
+        &mut self,
+        id: usize,
+        axis: Axis,
+        bounds: Bounds<gpui::Pixels>,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ratio) = split_ratio(axis, bounds, position) {
+            self.layout.resize(id, ratio);
+            cx.notify();
+        }
     }
 
     fn save_all(&mut self, cx: &App) -> bool {
@@ -1215,9 +1344,7 @@ impl Wevren {
         self.navigation.clear();
         self.navigation_index = None;
         self.tabs.clear();
-        self.layout.split = false;
-        self.layout.paths = [None, None];
-        self.layout.active = 0;
+        self.layout = PaneLayout::default();
         self.move_picker = false;
         self.entries.clear();
         self.selected_folder = Some(folder.clone());
@@ -1250,11 +1377,11 @@ impl Wevren {
             if record {
                 self.record_visit(path.clone());
             }
-            self.open = Some(path);
-            if self.layout.split && self.layout.paths[1 - self.layout.active] == self.open {
-                self.layout.active = 1 - self.layout.active;
+            self.open = Some(path.clone());
+            if let Some(pane) = self.layout.pane_for(&path) {
+                self.layout.active = pane;
             }
-            self.layout.paths[self.layout.active].clone_from(&self.open);
+            self.layout.set_path(self.layout.active, self.open.clone());
             self.selected_folder = self
                 .open
                 .as_ref()
@@ -1346,11 +1473,11 @@ impl Wevren {
             return;
         }
         self.tabs.remove(index);
-        for pane in &mut self.layout.paths {
+        self.layout.update_paths(|pane| {
             if pane.as_deref() == Some(path) {
                 *pane = None;
             }
-        }
+        });
         if active {
             self.open = None;
             self.baseline = None;
@@ -1364,9 +1491,7 @@ impl Wevren {
                 self.focus.focus(window);
             }
         }
-        if self.layout.split && self.layout.paths.contains(&None) {
-            self.toggle_split(window, cx);
-        }
+
         cx.notify();
     }
 
@@ -1388,7 +1513,7 @@ impl Wevren {
     }
 
     fn tab_bar(&self, theme: Theme, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
-        if self.tabs.is_empty() && !self.layout.split {
+        if self.tabs.is_empty() && self.layout.leaves().len() == 1 {
             return None;
         }
         let tabs = self.tabs.iter().enumerate().map(|(index, tab)| {
@@ -1877,11 +2002,13 @@ impl Wevren {
                 visited.clone_from(&path);
             }
         }
-        for pane in &mut self.layout.paths {
+        self.layout.update_paths(|pane| {
             if pane.as_deref() == Some(old) {
                 *pane = Some(path.clone());
+            } else if pane.as_ref() == Some(&path) {
+                *pane = None;
             }
-        }
+        });
         self.tabs.retain(|tab| tab.path != path || tab.path == old);
         for tab in &mut self.tabs {
             if tab.path == old {
@@ -2192,6 +2319,13 @@ impl Wevren {
                 return;
             }
         }
+        if event.keystroke.key == "escape" && cx.has_active_drag() {
+            cx.stop_active_drag(window);
+            self.resizing = false;
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         let action = self.settings.shortcuts.action(&event.keystroke);
         if self.move_picker {
             if event.keystroke.key == "escape" {
@@ -2228,7 +2362,9 @@ impl Wevren {
                 self.save(cx);
             }
             Action::NewNote => self.new_note(window, cx),
-            Action::Split => self.toggle_split(window, cx),
+            Action::Split => self.split_pane(self.layout.active, Edge::Right, window, cx),
+            Action::SplitBelow => self.split_pane(self.layout.active, Edge::Below, window, cx),
+            Action::ClosePane => self.close_pane(self.layout.active, window, cx),
             Action::Move => self.begin_move(window, cx),
             Action::NextTab => self.step_tab(false, window, cx),
             Action::PreviousTab => self.step_tab(true, window, cx),
@@ -2769,6 +2905,7 @@ impl Wevren {
             .child(div().flex_1().min_w_0().child(title));
         let column = column()
             .max_w(px(f32::from(self.settings.typography.text_width)))
+            .flex_none()
             .min_h_full()
             .pb_8()
             .child(header)
@@ -2796,6 +2933,7 @@ impl Wevren {
             .track_scroll(editor.read(cx).scroll_handle())
             .child(column);
         sheet(theme)
+            .min_h_0()
             .children(active.then(|| self.conflict_bar(theme, cx)).flatten())
             .when(active && self.find.is_some(), |sheet| {
                 sheet.child(self.find_bar(theme, cx))
@@ -2804,9 +2942,144 @@ impl Wevren {
             .into_any_element()
     }
 
-    fn pane_page(&self, pane: usize, theme: Theme, cx: &mut Context<Self>) -> Stateful<Div> {
-        let tab = self.layout.paths[pane]
-            .as_ref()
+    fn layout_node(&self, node: &Node, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
+        match node {
+            Node::Pane { id, .. } => self.pane_page(*id, theme, cx).into_any_element(),
+            Node::Split {
+                id,
+                axis,
+                ratio,
+                first,
+                second,
+            } => {
+                let id = *id;
+                let axis = *axis;
+                let ratio = *ratio;
+                let weak = cx.entity().downgrade();
+                let divider = div()
+                    .id(("pane-divider", id))
+                    .flex_none()
+                    .bg(theme.line)
+                    .hover(|style| style.bg(theme.accent))
+                    .when(axis == Axis::Horizontal, |divider| {
+                        divider
+                            .w(px(6.))
+                            .h_full()
+                            .cursor(gpui::CursorStyle::ResizeLeftRight)
+                    })
+                    .when(axis == Axis::Vertical, |divider| {
+                        divider
+                            .h(px(6.))
+                            .w_full()
+                            .cursor(gpui::CursorStyle::ResizeUpDown)
+                    })
+                    .on_drag(ResizedSplit(id), move |drag, _, window, cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            this.resizing = true;
+                            let bounds = this.layout_bounds.borrow().get(&id).copied();
+                            if let Some(bounds) = bounds {
+                                this.resize_split(id, axis, bounds, window.mouse_position(), cx);
+                            }
+                            cx.notify();
+                        });
+                        cx.new(|_| *drag)
+                    });
+                let size = node.minimum_size();
+                let first_size = first.minimum_size();
+                let second_size = second.minimum_size();
+                div()
+                    .id(("pane-split", id))
+                    .relative()
+                    .flex()
+                    .flex_1()
+                    .size_full()
+                    .min_w(px(size.0))
+                    .min_h(px(size.1))
+                    .when(axis == Axis::Vertical, Styled::flex_col)
+                    .on_drag_move(cx.listener(
+                        move |this, event: &gpui::DragMoveEvent<ResizedSplit>, _, cx| {
+                            if event.drag(cx).0 != id {
+                                return;
+                            }
+                            this.resize_split(id, axis, event.bounds, event.event.position, cx);
+                        },
+                    ))
+                    .child(self.capture_layout_bounds(id))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_basis(px(0.))
+                            .min_w_0()
+                            .min_h_0()
+                            .min_w(px(first_size.0))
+                            .min_h(px(first_size.1))
+                            .map(|mut view| {
+                                view.style().flex_grow = Some(ratio);
+                                view
+                            })
+                            .child(self.layout_node(first, theme, cx)),
+                    )
+                    .child(divider)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_basis(px(0.))
+                            .min_w_0()
+                            .min_h_0()
+                            .min_w(px(second_size.0))
+                            .min_h(px(second_size.1))
+                            .map(|mut view| {
+                                view.style().flex_grow = Some(1. - ratio);
+                                view
+                            })
+                            .child(self.layout_node(second, theme, cx)),
+                    )
+                    .into_any_element()
+            }
+        }
+    }
+
+    fn pane_action(
+        pane: PaneId,
+        action: Action,
+        glyph: &'static str,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        div()
+            .id((
+                SharedString::from(format!("pane-action-{pane}")),
+                action as usize,
+            ))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(24.))
+            .h_full()
+            .rounded_md()
+            .font_family(ICON_FONT)
+            .text_size(px(13.))
+            .text_color(theme.muted)
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.hover).text_color(theme.text))
+            .tooltip(move |_, cx| cx.new(|_| ActionTooltip(action.label())).into())
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                match action {
+                    Action::Split => this.split_pane(pane, Edge::Right, window, cx),
+                    Action::SplitBelow => this.split_pane(pane, Edge::Below, window, cx),
+                    Action::ClosePane => this.close_pane(pane, window, cx),
+                    _ => {}
+                }
+            }))
+            .child(glyph)
+    }
+
+    fn pane_page(&self, pane: PaneId, theme: Theme, cx: &mut Context<Self>) -> Stateful<Div> {
+        let tab = self
+            .layout
+            .path(pane)
             .and_then(|path| self.tabs.iter().find(|tab| tab.path == *path));
         let content = tab.map_or_else(
             || empty_page(theme),
@@ -2814,6 +3087,17 @@ impl Wevren {
         );
         div()
             .id(("pane", pane))
+            .relative()
+            .on_drop(cx.listener(move |this, source: &DraggedPane, window, cx| {
+                if let Some(edge) = this.drop_edge(pane, window.mouse_position()) {
+                    this.drop_pane(source.0, pane, edge, window, cx);
+                }
+            }))
+            .on_drop(cx.listener(move |this, note: &DraggedNote, window, cx| {
+                if let Some(edge) = this.drop_edge(pane, window.mouse_position()) {
+                    this.place_note(note.0.clone(), pane, edge, window, cx);
+                }
+            }))
             .capture_any_mouse_down(cx.listener(
                 move |this, event: &gpui::MouseDownEvent, window, cx| {
                     if event.button == MouseButton::Left && this.layout.active != pane {
@@ -2824,8 +3108,8 @@ impl Wevren {
             .flex()
             .flex_col()
             .flex_1()
-            .min_w_0()
-            .min_h_0()
+            .min_w(px(240.))
+            .min_h(px(160.))
             .gap_1()
             .when(!self.focus_mode, |view| {
                 let pinned = tab.is_some_and(|tab| self.settings.pinned_notes.contains(&tab.path));
@@ -2838,6 +3122,23 @@ impl Wevren {
                         .gap_2()
                         .px_3()
                         .h(px(28.))
+                        .flex_none()
+                        .child(
+                            div()
+                                .id(("pane-drag", pane))
+                                .flex_none()
+                                .px_1()
+                                .h_full()
+                                .flex()
+                                .items_center()
+                                .cursor(gpui::CursorStyle::OpenHand)
+                                .text_color(theme.muted)
+                                .child("⠿")
+                                .tooltip(|_, cx| {
+                                    cx.new(|_| ActionTooltip("Drag pane to rearrange")).into()
+                                })
+                                .on_drag(DraggedPane(pane), |drag, _, _, cx| cx.new(|_| *drag)),
+                        )
                         .child(
                             div()
                                 .id(("pane-select", pane))
@@ -2854,7 +3155,7 @@ impl Wevren {
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.select_pane(pane, window, cx)
                                 }))
-                                .when(self.layout.split, |label| {
+                                .when(self.layout.leaves().len() > 1, |label| {
                                     label.child(format!(
                                         "{}{}",
                                         tab.map_or_else(
@@ -2920,7 +3221,28 @@ impl Wevren {
                                         }))
                                         .child(FOCUS_GLYPH),
                                 )
-                        }),
+                        })
+                        .child(Self::pane_action(
+                            pane,
+                            Action::Split,
+                            "\u{e8a0}",
+                            theme,
+                            cx,
+                        ))
+                        .child(Self::pane_action(
+                            pane,
+                            Action::SplitBelow,
+                            "\u{e8a1}",
+                            theme,
+                            cx,
+                        ))
+                        .child(Self::pane_action(
+                            pane,
+                            Action::ClosePane,
+                            "\u{e8bb}",
+                            theme,
+                            cx,
+                        )),
                 )
             })
             .when(tab.is_none(), |view| {
@@ -2928,7 +3250,23 @@ impl Wevren {
                     cx.listener(move |this, _, window, cx| this.select_pane(pane, window, cx)),
                 )
             })
+            .child(self.capture_layout_bounds(pane))
             .child(content)
+            .when(
+                cx.has_active_drag() && !self.resizing && !self.focus_mode,
+                |view| {
+                    view.children(
+                        [
+                            None,
+                            Some(Edge::Left),
+                            Some(Edge::Right),
+                            Some(Edge::Above),
+                            Some(Edge::Below),
+                        ]
+                        .map(|edge| Self::pane_drop_zone(pane, edge, theme, cx)),
+                    )
+                },
+            )
     }
 
     fn find_bar(&self, theme: Theme, cx: &mut Context<Self>) -> Div {
@@ -3504,6 +3842,33 @@ impl Render for ActionTooltip {
 #[derive(Clone)]
 struct DraggedNote(PathBuf, gpui::Point<gpui::Pixels>);
 
+#[derive(Clone, Copy, Debug)]
+struct DraggedPane(PaneId);
+
+impl Render for DraggedPane {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.global::<Theme>();
+        div()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(theme.sheet)
+            .border_1()
+            .border_color(theme.accent)
+            .text_color(theme.text)
+            .child("Move pane")
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResizedSplit(usize);
+
+impl Render for ResizedSplit {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
 impl Render for DraggedNote {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
@@ -3573,6 +3938,10 @@ impl Render for DraggedNote {
 
 impl Render for Wevren {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.layout_bounds.borrow_mut().clear();
+        if !cx.has_active_drag() {
+            self.resizing = false;
+        }
         self.store_active_tab();
         if self.backlinks.target != self.open || self.backlinks.root != self.settings.folder {
             self.refresh_backlinks(cx);
@@ -3582,22 +3951,28 @@ impl Render for Wevren {
         let page = if self.settings_open || !has_folder {
             self.settings_page(theme, cx)
         } else {
-            div()
-                .relative()
-                .flex()
-                .flex_1()
-                .min_h_0()
-                .min_w_0()
-                .gap_2()
-                .children(
-                    self.layout
-                        .visible_panes(self.focus_mode)
-                        .map(|pane| self.pane_page(pane, theme, cx)),
-                )
-                .when(cx.has_active_drag() && !self.focus_mode, |view| {
-                    view.children([0, 1].map(|pane| Self::drop_zone(pane, theme, cx)))
-                })
-                .into_any_element()
+            if self.focus_mode {
+                self.layout_node(self.layout.projection(true), theme, cx)
+            } else {
+                let minimum = self.layout.root.minimum_size();
+                div()
+                    .id("pane-workspace")
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .overflow_scroll()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .size_full()
+                            .min_w(px(minimum.0))
+                            .min_h(px(minimum.1))
+                            .child(self.layout_node(self.layout.projection(false), theme, cx)),
+                    )
+                    .into_any_element()
+            }
         };
         let error = self
             .error
@@ -3613,6 +3988,24 @@ impl Render for Wevren {
             .text_sm()
             .text_color(theme.text)
             .on_key_down(cx.listener(Self::key_down))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.resizing {
+                        this.resizing = false;
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.resizing {
+                        this.resizing = false;
+                        cx.notify();
+                    }
+                }),
+            )
             .child(titlebar(
                 theme,
                 self.navigation_target(true).is_some(),
@@ -3653,57 +4046,19 @@ impl Render for Wevren {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::PaneLayout;
-    use std::path::PathBuf;
+mod pane_geometry_tests {
+    use super::*;
 
     #[test]
-    fn focus_projects_either_split_pane_and_restores_the_layout() {
-        let paths = [
-            Some(PathBuf::from("left.md")),
-            Some(PathBuf::from("right.md")),
-        ];
-        for active in 0..2 {
-            let layout = PaneLayout {
-                split: true,
-                paths: paths.clone(),
-                active,
-            };
-            let normal: Vec<_> = layout.visible_panes(false).collect();
-            let focused: Vec<_> = layout
-                .visible_panes(true)
-                .map(|pane| layout.paths[pane].clone())
-                .collect();
-            assert_eq!(focused, vec![paths[active].clone()]);
-            assert_eq!(layout.visible_panes(false).collect::<Vec<_>>(), normal);
-            assert_eq!(normal, vec![0, 1]);
-            assert_eq!(layout.paths, paths);
-            assert_eq!(layout.active, active);
-            assert!(layout.split);
-        }
-    }
-
-    #[test]
-    fn focused_empty_pane_does_not_replace_the_hidden_note() {
-        let mut layout = PaneLayout {
-            split: true,
-            paths: [
-                Some(PathBuf::from("left.md")),
-                Some(PathBuf::from("right.md")),
-            ],
-            active: 1,
-        };
-        layout.paths[layout.active] = None;
-        assert_eq!(layout.visible_panes(true).collect::<Vec<_>>(), vec![1]);
-        assert!(layout.paths[layout.active].is_none());
-        assert_eq!(layout.visible_panes(false).collect::<Vec<_>>(), vec![0, 1]);
-        assert_eq!(layout.paths[0], Some(PathBuf::from("left.md")));
-        assert_eq!(
-            PaneLayout::default()
-                .visible_panes(false)
-                .collect::<Vec<_>>(),
-            vec![0]
-        );
+    fn resizing_both_axes_uses_window_bounds_and_divider_center() {
+        let bounds = Bounds::new(gpui::point(px(10.), px(20.)), size(px(406.), px(206.)));
+        let position = gpui::point(px(113.), px(73.));
+        assert_eq!(split_ratio(Axis::Horizontal, bounds, position), Some(0.25));
+        assert_eq!(split_ratio(Axis::Vertical, bounds, position), Some(0.25));
+        let empty = Bounds::new(gpui::point(px(0.), px(0.)), size(px(6.), px(0.)));
+        assert!(split_ratio(Axis::Horizontal, empty, position).is_none());
+        assert!(split_ratio(Axis::Vertical, empty, position).is_none());
+        assert!(split_ratio(Axis::Horizontal, bounds, gpui::point(px(f32::NAN), px(0.))).is_none());
     }
 }
 

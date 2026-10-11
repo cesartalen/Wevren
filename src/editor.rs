@@ -811,6 +811,9 @@ impl Editor {
 
     /// Follows the link under the pointer when a click ends without selecting anything.
     fn mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if cx.has_active_drag() {
+            return;
+        }
         if self.selection.is_empty()
             && let Some(target) = self.link_under(event.position - self.origin)
         {

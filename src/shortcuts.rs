@@ -14,6 +14,8 @@ pub enum Action {
     Save,
     NewNote,
     Split,
+    SplitBelow,
+    ClosePane,
     Move,
     NextTab,
     PreviousTab,
@@ -35,13 +37,19 @@ pub enum Action {
     FencedCode,
 }
 
-pub const DEFAULTS: [(Action, &str, &str); 25] = [
+pub const DEFAULTS: [(Action, &str, &str); 27] = [
     (Action::Switcher, "Open note", "Ctrl+P"),
     (Action::WorkspaceSearch, "Search workspace", "Ctrl+Shift+F"),
     (Action::Find, "Find in note", "Ctrl+F"),
     (Action::Save, "Save note", "Ctrl+S"),
     (Action::NewNote, "New note", "Ctrl+N"),
-    (Action::Split, "Toggle split", "Ctrl+Backslash"),
+    (Action::Split, "Split pane right", "Ctrl+Backslash"),
+    (
+        Action::SplitBelow,
+        "Split pane below",
+        "Ctrl+Shift+Backslash",
+    ),
+    (Action::ClosePane, "Close pane", "Ctrl+Shift+W"),
     (Action::Move, "Move note", "Ctrl+Shift+M"),
     (Action::NextTab, "Next tab", "Ctrl+Tab"),
     (Action::PreviousTab, "Previous tab", "Ctrl+Shift+Tab"),
@@ -247,6 +255,11 @@ impl<'de> Deserialize<'de> for Bindings {
             return Ok(Self::default());
         };
         let mut bindings = Self::default();
+        for action in [Action::SplitBelow, Action::ClosePane] {
+            if !custom.contains_key(&action) {
+                bindings.0.remove(&action);
+            }
+        }
         bindings.0.extend(custom);
         if bindings
             .0
@@ -256,6 +269,22 @@ impl<'de> Deserialize<'de> for Bindings {
             != bindings.0.len()
         {
             return Ok(Self::default());
+        }
+        for &(action, _, default) in &DEFAULTS {
+            if bindings.0.contains_key(&action) {
+                continue;
+            }
+            let default = Chord::try_from(default.to_owned()).unwrap();
+            let chord =
+                std::iter::once(default)
+                    .chain((1..=12).flat_map(|number| {
+                        ["Ctrl", "Ctrl+Shift", "Alt+Shift"].into_iter().filter_map(
+                            move |modifiers| Chord::try_from(format!("{modifiers}+F{number}")).ok(),
+                        )
+                    }))
+                    .find(|chord| !bindings.0.values().any(|existing| existing == chord))
+                    .expect("registered shortcuts leave spare function key bindings");
+            bindings.0.insert(action, chord);
         }
         Ok(bindings)
     }
@@ -327,6 +356,55 @@ mod tests {
             Some(crate::formatting::Command::Heading(6))
         );
         assert_eq!(Action::Switcher.formatting(), None);
+    }
+
+    #[test]
+    fn adding_pane_actions_preserves_legacy_custom_bindings() {
+        let mut old = Bindings::default();
+        old.0.remove(&Action::SplitBelow);
+        old.0.remove(&Action::ClosePane);
+        old.0.insert(Action::Bold, chord("Ctrl+Shift+W"));
+        let migrated: Bindings =
+            serde_json::from_str(&serde_json::to_string(&old).unwrap()).unwrap();
+        for (&action, chord) in &old.0 {
+            assert_eq!(migrated.chord(action), chord);
+        }
+        assert_ne!(
+            migrated.chord(Action::ClosePane),
+            migrated.chord(Action::Bold)
+        );
+        assert_eq!(migrated.0.len(), DEFAULTS.len());
+    }
+
+    #[test]
+    fn pane_binding_migration_handles_occupied_function_keys() {
+        let mut old = Bindings::default();
+        old.0.remove(&Action::SplitBelow);
+        old.0.remove(&Action::ClosePane);
+        for (index, (_, binding)) in old.0.iter_mut().enumerate() {
+            if index < 12 {
+                *binding = chord(&format!("Ctrl+Shift+F{}", index + 1));
+            }
+            if index == 12 {
+                *binding = chord("Ctrl+Shift+W");
+            }
+            if index == 13 {
+                *binding = chord("Ctrl+Shift+Backslash");
+            }
+        }
+        let migrated: Bindings =
+            serde_json::from_str(&serde_json::to_string(&old).unwrap()).unwrap();
+        for (&action, binding) in &old.0 {
+            assert_eq!(migrated.chord(action), binding);
+        }
+        assert_eq!(
+            migrated
+                .0
+                .values()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            DEFAULTS.len()
+        );
     }
 
     #[test]
