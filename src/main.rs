@@ -2664,18 +2664,22 @@ impl Wevren {
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.select_pane(pane, window, cx)
                                 }))
-                                .child(format!(
-                                    "{}{}",
-                                    tab.map_or_else(
-                                        || "No note is open".to_owned(),
-                                        |tab| notes::title(&tab.path)
-                                    ),
-                                    if tab.is_some_and(|tab| tab.dirty || tab.conflict.is_some()) {
-                                        " (unsaved changes)"
-                                    } else {
-                                        ""
-                                    }
-                                )),
+                                .when(self.layout.split, |label| {
+                                    label.child(format!(
+                                        "{}{}",
+                                        tab.map_or_else(
+                                            || "No note is open".to_owned(),
+                                            |tab| notes::title(&tab.path)
+                                        ),
+                                        if tab.is_some_and(|tab| {
+                                            tab.dirty || tab.conflict.is_some()
+                                        }) {
+                                            " (unsaved changes)"
+                                        } else {
+                                            ""
+                                        }
+                                    ))
+                                }),
                         )
                         .when(pane == self.layout.active && tab.is_some(), |header| {
                             let pin_path = path.expect("note tab has a path");
