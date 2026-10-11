@@ -2406,6 +2406,7 @@ impl Wevren {
                         .id(("pane-header", pane))
                         .px_3()
                         .py_1()
+                        .truncate()
                         .cursor_pointer()
                         .text_size(px(11.))
                         .text_color(if pane == self.layout.active {
@@ -2417,8 +2418,11 @@ impl Wevren {
                             this.select_pane(pane, window, cx);
                         }))
                         .child(format!(
-                            "{} pane{}",
-                            if pane == 0 { "Left" } else { "Right" },
+                            "{}{}",
+                            tab.map_or_else(
+                                || "No note is open".to_owned(),
+                                |tab| notes::title(&tab.path),
+                            ),
                             if tab.is_some_and(|tab| tab.dirty || tab.conflict.is_some()) {
                                 " (unsaved changes)"
                             } else {
